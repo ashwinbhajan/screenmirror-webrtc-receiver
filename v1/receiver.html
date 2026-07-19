@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>Screen Mirror WebRTC Development Receiver</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <!-- CAF v3 is supplied by the Cast receiver runtime. No media player is used. -->
+    <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+    <script src="./receiver.js" defer></script>
+  </head>
+  <body>
+    <main class="receiver-status" aria-live="polite">
+      <p class="eyebrow">Screen Mirror · development only</p>
+      <h1>WebRTC capability bootstrap</h1>
+      <dl>
+        <div>
+          <dt>Receiver version</dt>
+          <dd id="receiver-version">Loading…</dd>
+        </div>
+        <div>
+          <dt>Connection state</dt>
+          <dd id="connection-state">Starting</dd>
+        </div>
+        <div>
+          <dt>Last event</dt>
+          <dd id="last-event">Initializing</dd>
+        </div>
+      </dl>
+      <p id="status-detail" class="status-detail">Preparing Cast receiver context…</p>
+      <p class="scope-note">
+        Namespace bootstrap only. No WebRTC, media, HLS, audio, or video transport is active.
+      </p>
+    </main>
+  </body>
+</html>
