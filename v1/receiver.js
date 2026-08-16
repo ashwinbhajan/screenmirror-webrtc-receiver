@@ -201,7 +201,15 @@
     try {
       receiverContext = global.cast.framework.CastReceiverContext.getInstance();
       receiverContext.addCustomMessageListener(NAMESPACE, handleMessage);
-      receiverContext.start();
+      // Declare the custom namespace at receiver start, rather than relying
+      // solely on the listener registration. CAF publishes this declaration
+      // in the receiver metadata that the iOS sender uses to establish its
+      // GCKGenericChannel.
+      const receiverOptions = new global.cast.framework.CastReceiverOptions();
+      receiverOptions.customNamespaces = {
+        [NAMESPACE]: global.cast.framework.system.MessageType.JSON
+      };
+      receiverContext.start(receiverOptions);
       recordEvent("receiver_ready", "none");
       setVisibleState("Ready", "Listening on protocol v" + PROTOCOL_VERSION);
     } catch (_) {
