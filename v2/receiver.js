@@ -77,7 +77,7 @@
     if (!capabilityResult()) { sendMediaResult(event.senderId, request.requestId, "unsupported"); return; }
     const video = document.getElementById("probe-video");
     const pending = []; const maxPending = 8;
-    let source; let buffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let firstRendered = false; let appendBacklogHighWatermark = 0; let initAppendPending = false; let initAppendTimeout;
+    let source; let buffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let firstRendered = false; let appendBacklogHighWatermark = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false;
     const clearInitAppendTimeout = () => { if (initAppendTimeout) { global.clearTimeout(initAppendTimeout); initAppendTimeout = undefined; } };
     const stop = (result) => { clearInitAppendTimeout(); try { socket && socket.close(); } catch (_) {} sendMediaResult(event.senderId, request.requestId, result); };
     const appendNext = () => {
@@ -90,8 +90,13 @@
           if (initAppendPending) { sendMediaResult(event.senderId, request.requestId, "init_append_timeout"); stop("append_failed"); }
         }, 5000);
       }
+      if (item.type === 2) {
+        mediaAppendPending = true;
+        sendMediaResult(event.senderId, request.requestId, `media_append_started_len_${item.payload.byteLength}`);
+      }
       try { buffer.appendBuffer(item.payload); } catch (_) {
         if (item.type === 1) sendMediaResult(event.senderId, request.requestId, "init_append_synchronous_exception");
+        if (item.type === 2) sendMediaResult(event.senderId, request.requestId, "media_append_synchronous_exception");
         stop("append_failed");
       }
     };
@@ -112,6 +117,10 @@
               sendMediaResult(event.senderId, request.requestId, "init_append_updateend");
             }
             if (lastAppendingType === 2) firstMediaAppended = true;
+            if (lastAppendingType === 2 && mediaAppendPending) {
+              mediaAppendPending = false;
+              sendMediaResult(event.senderId, request.requestId, "media_append_updateend");
+            }
             if (firstKeyframe && firstMediaAppended && !firstRendered) {
               firstRendered = true;
               Promise.resolve(video.play()).then(() => {
@@ -127,10 +136,12 @@
           });
           buffer.addEventListener("error", () => {
             if (lastAppendingType === 1 && initAppendPending) sendMediaResult(event.senderId, request.requestId, "init_append_error_event");
+            if (lastAppendingType === 2 && mediaAppendPending) sendMediaResult(event.senderId, request.requestId, "media_append_error_event");
             stop("append_failed");
           });
           buffer.addEventListener("abort", () => {
             if (lastAppendingType === 1 && initAppendPending) sendMediaResult(event.senderId, request.requestId, "init_append_abort_event");
+            if (lastAppendingType === 2 && mediaAppendPending) sendMediaResult(event.senderId, request.requestId, "media_append_abort_event");
             stop("append_aborted");
           });
           socket = new global.WebSocket(request.endpoint); socket.binaryType = "arraybuffer";
@@ -141,7 +152,16 @@
             }
             const envelope = parseEnvelope(message.data); if (!envelope) { stop("binary_envelope_invalid"); return; }
             if (envelope.type === 1) { enqueue(envelope); return; }
-            if (envelope.type === 2) { firstKeyframe = true; enqueue(envelope); return; }
+            if (envelope.type === 2) {
+              const summary = summarizeFragment(envelope.payload);
+              if (summary) {
+                sendMediaResult(event.senderId, request.requestId, `media_fragment_received_len_${envelope.payload.byteLength}`);
+                sendMediaResult(event.senderId, request.requestId, `first_fragment_seq_${summary.sequence}_samples_${summary.sampleCount}_tfdt_${summary.decodeTime}_offset_${summary.dataOffset}_payload_${summary.payloadLength}_nal_${summary.firstNALType}`);
+              } else {
+                sendMediaResult(event.senderId, request.requestId, "media_fragment_layout_invalid");
+              }
+              firstKeyframe = true; enqueue(envelope); return;
+            }
             stop("binary_envelope_invalid");
           };
           socket.onerror = () => stop("websocket_failed"); socket.onclose = () => { if (!firstRendered) sendMediaResult(event.senderId, request.requestId, "websocket_closed"); };
@@ -159,6 +179,28 @@
     if (String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]) !== "SMC1" || bytes[4] !== 2 || (bytes[5] !== 1 && bytes[5] !== 2)) return null;
     const length = view.getUint32(10); if (length !== bytes.length - 14 || length > 1048576) return null;
     return { type: bytes[5], sequence: view.getUint32(6), payload: value.slice(14) };
+  }
+  function summarizeFragment(value) {
+    if (!(value instanceof ArrayBuffer)) return null;
+    const bytes = new Uint8Array(value); const view = new DataView(value);
+    const readBoxes = (start, end) => {
+      const result = []; for (let offset = start; offset + 8 <= end;) {
+        const size = view.getUint32(offset); if (size < 8 || offset + size > end) return null;
+        result.push({ offset, size, type: String.fromCharCode(bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7]) }); offset += size;
+      } return result;
+    };
+    const top = readBoxes(0, bytes.length); if (!top) return null;
+    const moof = top.find((box) => box.type === "moof"); const mdat = top.find((box) => box.type === "mdat");
+    if (!moof || !mdat) return null;
+    const moofChildren = readBoxes(moof.offset + 8, moof.offset + moof.size); if (!moofChildren) return null;
+    const mfhd = moofChildren.find((box) => box.type === "mfhd"); const traf = moofChildren.find((box) => box.type === "traf"); if (!mfhd || !traf) return null;
+    const trafChildren = readBoxes(traf.offset + 8, traf.offset + traf.size); if (!trafChildren) return null;
+    const tfdt = trafChildren.find((box) => box.type === "tfdt"); const trun = trafChildren.find((box) => box.type === "trun"); if (!tfdt || !trun || trun.size < 20) return null;
+    const version = bytes[tfdt.offset + 8]; const decodeTime = version === 1 ? Number(view.getBigUint64(tfdt.offset + 12)) : view.getUint32(tfdt.offset + 12);
+    const dataOffset = view.getUint32(trun.offset + 16); const payloadStart = moof.offset + dataOffset;
+    if (payloadStart < mdat.offset + 8 || payloadStart + 5 > mdat.offset + mdat.size) return null;
+    const nalLength = view.getUint32(payloadStart); if (nalLength === 0 || payloadStart + 4 + nalLength > mdat.offset + mdat.size) return null;
+    return { sequence: view.getUint32(mfhd.offset + 12), sampleCount: view.getUint32(trun.offset + 12), decodeTime, dataOffset, payloadLength: mdat.size - 8, firstNALType: bytes[payloadStart + 4] & 0x1f };
   }
   function bufferedLead(video) {
     for (let i = 0; i < video.buffered.length; i += 1) if (video.currentTime >= video.buffered.start(i) && video.currentTime <= video.buffered.end(i)) return video.buffered.end(i) - video.currentTime;
