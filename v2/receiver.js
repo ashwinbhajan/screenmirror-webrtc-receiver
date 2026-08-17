@@ -8,16 +8,16 @@
   const MAX_MESSAGE_BYTES = 1024;
   const REQUEST_ID = /^[A-Za-z0-9._-]{1,64}$/;
   const RESULT = Object.freeze({
-    CAPABILITY_READY: "capability_ready",
-    CAPABILITY_UNSUPPORTED: "capability_unsupported",
-    CONNECTED: "websocket_connected",
+    PASS: "capability_pass",
+    PARTIAL: "capability_partial",
+    FAILED: "capability_failed",
     MIXED_CONTENT_BLOCKED: "websocket_mixed_content_blocked",
-    FAILED: "websocket_failed"
+    WEBSOCKET_FAILED: "websocket_failed"
   });
 
   let context;
   let ui;
-  let capabilities = Object.freeze({ webSocketAPI: false, mediaSource: false, avcMIME: false, sourceBuffer: false, autoplay: "timeout" });
+  let capabilities = Object.freeze({ webSocketAPI: false, mediaSource: false, avcMIME: false, sourceBuffer: false, autoplay: "deferred", websocketAttempted: false, websocketAuthenticated: false, probeAckStatus: "not_attempted", terminalStatus: "capability_partial" });
   let capabilityReadyPromise = Promise.resolve(capabilities);
 
   function byteLength(value) { return new TextEncoder().encode(value).length; }
@@ -53,12 +53,7 @@
     return message;
   }
   function capabilityResult() {
-    // A muted play() promise can remain pending without media bytes. Only an
-    // explicit NotAllowedError is an autoplay-policy stop condition; timeout
-    // and non-policy errors are reported in the matrix but still permit the
-    // independent WebSocket security experiment.
-    return capabilities.webSocketAPI && capabilities.mediaSource && capabilities.avcMIME && capabilities.sourceBuffer && capabilities.autoplay !== "blocked"
-      ? RESULT.CAPABILITY_READY : RESULT.CAPABILITY_UNSUPPORTED;
+    return capabilities.webSocketAPI && capabilities.mediaSource && capabilities.avcMIME && capabilities.sourceBuffer;
   }
   function send(senderId, requestId, result) {
     context.sendCustomMessage(NAMESPACE, senderId, makeResult(requestId, result));
@@ -69,32 +64,40 @@
     capabilityReadyPromise.then(() => runWebSocketProbe(event.senderId, request));
   }
   function runWebSocketProbe(senderId, request) {
-    const preliminary = capabilityResult();
-    if (preliminary !== RESULT.CAPABILITY_READY) { send(senderId, request.requestId, preliminary); update("Unsupported", preliminary); return; }
+    if (!capabilityResult()) { send(senderId, request.requestId, RESULT.FAILED); update("Unsupported", RESULT.FAILED); return; }
     let socket;
     let finished = false;
-    const complete = (result) => {
+    const complete = (result, terminalStatus, probeAckStatus) => {
       if (finished) return;
       finished = true;
       global.clearTimeout(timeout);
       try { socket && socket.close(); } catch (_) {}
+      capabilities = Object.freeze({ ...capabilities, probeAckStatus, terminalStatus });
       send(senderId, request.requestId, result);
-      update(result === RESULT.CONNECTED ? "Connected" : "Stopped", result);
+      update(result === RESULT.PASS ? "Passed" : "Stopped", result);
     };
     try {
       socket = new global.WebSocket(request.endpoint);
-      socket.onopen = () => socket.send(JSON.stringify({ type: "hello", token: new URL(request.endpoint).pathname.slice(1) }));
+      socket.onopen = () => {
+        capabilities = Object.freeze({ ...capabilities, websocketAttempted: true });
+        socket.send(JSON.stringify({ type: "hello", token: new URL(request.endpoint).pathname.slice(1) }));
+      };
       socket.onmessage = (message) => {
         const acknowledgement = parse(message.data);
-        complete(acknowledgement && acknowledgement.type === "ack" && Object.keys(acknowledgement).length === 1 ? RESULT.CONNECTED : RESULT.FAILED);
+        if (acknowledgement && acknowledgement.type === "ack" && Object.keys(acknowledgement).length === 1) {
+          capabilities = Object.freeze({ ...capabilities, websocketAuthenticated: true });
+          complete(RESULT.PASS, "capability_pass", "confirmed");
+        } else {
+          complete(RESULT.FAILED, "capability_failed", "rejected");
+        }
       };
-      socket.onerror = () => complete(global.isSecureContext ? RESULT.MIXED_CONTENT_BLOCKED : RESULT.FAILED);
-      socket.onclose = () => { if (!finished) complete(global.isSecureContext ? RESULT.MIXED_CONTENT_BLOCKED : RESULT.FAILED); };
-    } catch (_) { complete(global.isSecureContext ? RESULT.MIXED_CONTENT_BLOCKED : RESULT.FAILED); return; }
-    const timeout = global.setTimeout(() => complete(global.isSecureContext ? RESULT.MIXED_CONTENT_BLOCKED : RESULT.FAILED), 5000);
+      socket.onerror = () => complete(global.isSecureContext ? RESULT.MIXED_CONTENT_BLOCKED : RESULT.WEBSOCKET_FAILED, "capability_failed", "transport_error");
+      socket.onclose = () => { if (!finished) complete(global.isSecureContext ? RESULT.MIXED_CONTENT_BLOCKED : RESULT.WEBSOCKET_FAILED, "capability_failed", "transport_error"); };
+    } catch (_) { complete(global.isSecureContext ? RESULT.MIXED_CONTENT_BLOCKED : RESULT.WEBSOCKET_FAILED, "capability_failed", "transport_error"); return; }
+    const timeout = global.setTimeout(() => complete(global.isSecureContext ? RESULT.MIXED_CONTENT_BLOCKED : RESULT.WEBSOCKET_FAILED, "capability_failed", "transport_error"), 5000);
   }
   function testCapabilities(video) {
-    const result = { webSocketAPI: typeof global.WebSocket === "function", mediaSource: typeof global.MediaSource === "function", avcMIME: false, sourceBuffer: false, autoplay: "timeout" };
+    const result = { webSocketAPI: typeof global.WebSocket === "function", mediaSource: typeof global.MediaSource === "function", avcMIME: false, sourceBuffer: false, autoplay: "deferred", websocketAttempted: false, websocketAuthenticated: false, probeAckStatus: "not_attempted", terminalStatus: "capability_partial" };
     result.avcMIME = result.mediaSource && global.MediaSource.isTypeSupported(MIME_TYPE) === true;
     const sourceBufferReady = new Promise((resolve) => {
       if (!result.avcMIME) { resolve(false); return; }
@@ -108,18 +111,9 @@
         }, { once: true });
       } catch (_) { resolve(false); }
     });
-    const autoplayReady = new Promise((resolve) => {
-      try {
-        const playing = video.play();
-        if (!playing || typeof playing.then !== "function") { resolve("timeout"); return; }
-        const timeout = global.setTimeout(() => resolve("timeout"), 1500);
-        playing.then(() => { global.clearTimeout(timeout); resolve("allowed"); })
-          .catch((error) => { global.clearTimeout(timeout); resolve(error && error.name === "NotAllowedError" ? "blocked" : "non_policy_error"); });
-      } catch (error) { resolve(error && error.name === "NotAllowedError" ? "blocked" : "non_policy_error"); }
-    });
-    return Promise.all([sourceBufferReady, autoplayReady]).then(([sourceBuffer, autoplay]) => {
-      capabilities = Object.freeze({ ...result, sourceBuffer, autoplay });
-      update(capabilityResult() === RESULT.CAPABILITY_READY ? "Ready" : "Unsupported", "Capability checks completed");
+    return sourceBufferReady.then((sourceBuffer) => {
+      capabilities = Object.freeze({ ...result, sourceBuffer });
+      update(capabilityResult() ? "Ready" : "Unsupported", "Autoplay deferred until decodable media");
       return capabilities;
     });
   }

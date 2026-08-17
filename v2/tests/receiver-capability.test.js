@@ -28,7 +28,8 @@ test("pins the planned AVC MIME type", () => {
 });
 
 test("does not expose endpoint data in the safe capability snapshot", () => {
-  assert.deepEqual(Object.keys(receiver().snapshot()).sort(), ["autoplay", "avcMIME", "mediaSource", "sourceBuffer", "webSocketAPI"]);
+  assert.deepEqual(Object.keys(receiver().snapshot()).sort(), ["autoplay", "avcMIME", "mediaSource", "probeAckStatus", "sourceBuffer", "terminalStatus", "webSocketAPI", "websocketAttempted", "websocketAuthenticated"]);
+  assert.equal(receiver().snapshot().autoplay, "deferred");
 });
 
 test("uses the explicit mixed-content stop classification", () => {
