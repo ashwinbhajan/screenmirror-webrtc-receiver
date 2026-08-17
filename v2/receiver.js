@@ -76,10 +76,35 @@
   function runMedia(event, request) {
     if (!capabilityResult()) { sendMediaResult(event.senderId, request.requestId, "unsupported"); return; }
     const video = document.getElementById("probe-video");
+    document.body.classList.add("media-active");
+    update("Media", "Waiting for the first decodable video frame");
     const pending = []; const maxPending = 8;
-    let source; let buffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let firstRendered = false; let appendBacklogHighWatermark = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false;
+    let source; let buffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let firstRendered = false; let playAttempted = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let playTimeout;
     const clearInitAppendTimeout = () => { if (initAppendTimeout) { global.clearTimeout(initAppendTimeout); initAppendTimeout = undefined; } };
-    const stop = (result) => { clearInitAppendTimeout(); try { socket && socket.close(); } catch (_) {} sendMediaResult(event.senderId, request.requestId, result); };
+    const clearPlayTimeout = () => { if (playTimeout) { global.clearTimeout(playTimeout); playTimeout = undefined; } };
+    const stop = (result) => { clearInitAppendTimeout(); clearPlayTimeout(); try { socket && socket.close(); } catch (_) {} sendMediaResult(event.senderId, request.requestId, result); };
+    const safePlayRejection = (error) => {
+      if (error && error.name === "NotAllowedError") return "play_rejected_not_allowed";
+      if (error && error.name === "NotSupportedError") return "play_rejected_not_supported";
+      if (error && error.name === "AbortError") return "play_rejected_abort";
+      return "play_rejected_other";
+    };
+    const attemptPlay = () => {
+      if (playAttempted || !firstKeyframe || !firstMediaAppended || !buffer || buffer.updating) return;
+      playAttempted = true;
+      sendMediaResult(event.senderId, request.requestId, "play_attempt_started");
+      let promise;
+      try { promise = video.play(); } catch (_) { sendMediaResult(event.senderId, request.requestId, "play_synchronous_exception"); return; }
+      sendMediaResult(event.senderId, request.requestId, "play_promise_pending");
+      playTimeout = global.setTimeout(() => sendMediaResult(event.senderId, request.requestId, "play_pending_timeout"), 5000);
+      Promise.resolve(promise).then(() => {
+        clearPlayTimeout();
+        sendMediaResult(event.senderId, request.requestId, "play_promise_resolved");
+      }).catch((error) => {
+        clearPlayTimeout();
+        sendMediaResult(event.senderId, request.requestId, safePlayRejection(error));
+      });
+    };
     const appendNext = () => {
       if (!buffer || buffer.updating || !pending.length) return;
       const item = pending.shift(); lastAppendingType = item.type;
@@ -121,13 +146,7 @@
               mediaAppendPending = false;
               sendMediaResult(event.senderId, request.requestId, "media_append_updateend");
             }
-            if (firstKeyframe && firstMediaAppended && !firstRendered) {
-              firstRendered = true;
-              Promise.resolve(video.play()).then(() => {
-                sendMediaResult(event.senderId, request.requestId, "autoplay_started");
-                context.sendCustomMessage(NAMESPACE, event.senderId, { type: "firstRenderedFrame", protocolVersion: PROTOCOL_VERSION, requestId: request.requestId, receiverVersion: RECEIVER_VERSION, appendBacklogHighWatermark });
-              }).catch((error) => sendMediaResult(event.senderId, request.requestId, error && error.name === "NotAllowedError" ? "autoplay_blocked" : "autoplay_failed"));
-            }
+            attemptPlay();
             // Keep the live edge bounded without accumulating an HLS-like buffer.
             if (bufferedLead(video) > 1.5 && typeof buffer.remove === "function" && !buffer.updating) {
               try { buffer.remove(0, Math.max(0, video.currentTime - 0.1)); } catch (_) {}
@@ -171,6 +190,22 @@
       source.addEventListener("sourceended", () => sendMediaResult(event.senderId, request.requestId, "media_source_state_ended"));
       source.addEventListener("sourceclose", () => sendMediaResult(event.senderId, request.requestId, "media_source_state_closed"));
       video.addEventListener("error", () => sendMediaResult(event.senderId, request.requestId, `media_element_error_code_${video.error ? video.error.code : 0}`));
+      video.addEventListener("loadedmetadata", () => sendMediaResult(event.senderId, request.requestId, "media_event_loadedmetadata"));
+      video.addEventListener("loadeddata", () => sendMediaResult(event.senderId, request.requestId, "media_event_loadeddata"));
+      video.addEventListener("canplay", () => sendMediaResult(event.senderId, request.requestId, "media_event_canplay"));
+      video.addEventListener("canplaythrough", () => sendMediaResult(event.senderId, request.requestId, "media_event_canplaythrough"));
+      video.addEventListener("waiting", () => sendMediaResult(event.senderId, request.requestId, "media_event_waiting"));
+      video.addEventListener("stalled", () => sendMediaResult(event.senderId, request.requestId, "media_event_stalled"));
+      video.addEventListener("playing", () => {
+        sendMediaResult(event.senderId, request.requestId, "media_event_playing");
+        if (!firstRendered && firstMediaAppended) {
+          firstRendered = true;
+          context.sendCustomMessage(NAMESPACE, event.senderId, { type: "firstRenderedFrame", protocolVersion: PROTOCOL_VERSION, requestId: request.requestId, receiverVersion: RECEIVER_VERSION, appendBacklogHighWatermark });
+        }
+      });
+      video.addEventListener("timeupdate", () => {
+        if (!timeUpdated) { timeUpdated = true; sendMediaResult(event.senderId, request.requestId, "media_event_timeupdate"); }
+      });
     } catch (_) { stop("media_source_failed"); }
   }
   function parseEnvelope(value) {
