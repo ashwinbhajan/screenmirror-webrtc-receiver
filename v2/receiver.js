@@ -53,7 +53,11 @@
     return message;
   }
   function capabilityResult() {
-    return capabilities.webSocketAPI && capabilities.mediaSource && capabilities.avcMIME && capabilities.sourceBuffer && capabilities.autoplay === "allowed"
+    // A muted play() promise can remain pending without media bytes. Only an
+    // explicit NotAllowedError is an autoplay-policy stop condition; timeout
+    // and non-policy errors are reported in the matrix but still permit the
+    // independent WebSocket security experiment.
+    return capabilities.webSocketAPI && capabilities.mediaSource && capabilities.avcMIME && capabilities.sourceBuffer && capabilities.autoplay !== "blocked"
       ? RESULT.CAPABILITY_READY : RESULT.CAPABILITY_UNSUPPORTED;
   }
   function send(senderId, requestId, result) {
