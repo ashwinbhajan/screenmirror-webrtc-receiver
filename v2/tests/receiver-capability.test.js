@@ -28,7 +28,7 @@ test("pins the planned AVC MIME type", () => {
 });
 
 test("does not expose endpoint data in the safe capability snapshot", () => {
-  assert.deepEqual(Object.keys(receiver().snapshot()).sort(), ["autoplay", "avcMIME", "mediaSource", "probeAckStatus", "sourceBuffer", "terminalStatus", "webSocketAPI", "websocketAttempted", "websocketAuthenticated"]);
+  assert.deepEqual(Object.keys(receiver().snapshot()).sort(), ["autoplay", "avcMIME", "mediaSource", "probeAckStatus", "sourceBuffer", "terminalStatus", "webSocketAPI", "websocketAttempted", "websocketAuthenticated", "websocketLifecycle"]);
   assert.equal(receiver().snapshot().autoplay, "deferred");
 });
 

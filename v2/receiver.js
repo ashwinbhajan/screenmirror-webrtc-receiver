@@ -17,7 +17,7 @@
 
   let context;
   let ui;
-  let capabilities = Object.freeze({ webSocketAPI: false, mediaSource: false, avcMIME: false, sourceBuffer: false, autoplay: "deferred", websocketAttempted: false, websocketAuthenticated: false, probeAckStatus: "not_attempted", terminalStatus: "capability_partial" });
+  let capabilities = Object.freeze({ webSocketAPI: false, mediaSource: false, avcMIME: false, sourceBuffer: false, autoplay: "deferred", websocketAttempted: false, websocketAuthenticated: false, probeAckStatus: "not_attempted", terminalStatus: "capability_partial", websocketLifecycle: "not_attempted" });
   let capabilityReadyPromise = Promise.resolve(capabilities);
 
   function byteLength(value) { return new TextEncoder().encode(value).length; }
@@ -67,37 +67,57 @@
     if (!capabilityResult()) { send(senderId, request.requestId, RESULT.FAILED); update("Unsupported", RESULT.FAILED); return; }
     let socket;
     let finished = false;
+    const timeoutRef = { id: null };
     const complete = (result, terminalStatus, probeAckStatus) => {
       if (finished) return;
       finished = true;
-      global.clearTimeout(timeout);
+      if (timeoutRef.id !== null) global.clearTimeout(timeoutRef.id);
       try { socket && socket.close(); } catch (_) {}
       capabilities = Object.freeze({ ...capabilities, probeAckStatus, terminalStatus });
       send(senderId, request.requestId, result);
       update(result === RESULT.PASS ? "Passed" : "Stopped", result);
     };
+    let opened = false;
     try {
       socket = new global.WebSocket(request.endpoint);
       socket.onopen = () => {
-        capabilities = Object.freeze({ ...capabilities, websocketAttempted: true });
+        opened = true;
+        capabilities = Object.freeze({ ...capabilities, websocketAttempted: true, websocketLifecycle: "opened" });
         socket.send(JSON.stringify({ type: "hello", token: new URL(request.endpoint).pathname.slice(1) }));
       };
       socket.onmessage = (message) => {
         const acknowledgement = parse(message.data);
         if (acknowledgement && acknowledgement.type === "ack" && Object.keys(acknowledgement).length === 1) {
-          capabilities = Object.freeze({ ...capabilities, websocketAuthenticated: true });
-          complete(RESULT.PASS, "capability_pass", "confirmed");
+          capabilities = Object.freeze({ ...capabilities, websocketAuthenticated: true, websocketLifecycle: "ack_received" });
+          socket.send(JSON.stringify({ type: "confirmed" }));
+          global.setTimeout(() => complete(RESULT.PASS, "capability_pass", "confirmed"), 50);
         } else {
           complete(RESULT.FAILED, "capability_failed", "rejected");
         }
       };
-      socket.onerror = () => complete(global.isSecureContext ? RESULT.MIXED_CONTENT_BLOCKED : RESULT.WEBSOCKET_FAILED, "capability_failed", "transport_error");
-      socket.onclose = () => { if (!finished) complete(global.isSecureContext ? RESULT.MIXED_CONTENT_BLOCKED : RESULT.WEBSOCKET_FAILED, "capability_failed", "transport_error"); };
-    } catch (_) { complete(global.isSecureContext ? RESULT.MIXED_CONTENT_BLOCKED : RESULT.WEBSOCKET_FAILED, "capability_failed", "transport_error"); return; }
-    const timeout = global.setTimeout(() => complete(global.isSecureContext ? RESULT.MIXED_CONTENT_BLOCKED : RESULT.WEBSOCKET_FAILED, "capability_failed", "transport_error"), 5000);
+      socket.onerror = () => {
+        capabilities = Object.freeze({ ...capabilities, websocketLifecycle: opened ? "closed_before_auth" : "error_before_open" });
+        complete(RESULT.WEBSOCKET_FAILED, "capability_failed", "transport_error");
+      };
+      socket.onclose = () => {
+        if (!finished) {
+          capabilities = Object.freeze({ ...capabilities, websocketLifecycle: opened ? "closed_before_auth" : "error_before_open" });
+          complete(RESULT.WEBSOCKET_FAILED, "capability_failed", "transport_error");
+        }
+      };
+    } catch (error) {
+      const securityRejected = error && error.name === "SecurityError";
+      capabilities = Object.freeze({ ...capabilities, websocketLifecycle: securityRejected ? "constructor_security_rejected" : "error_before_open" });
+      complete(securityRejected ? RESULT.MIXED_CONTENT_BLOCKED : RESULT.WEBSOCKET_FAILED, "capability_failed", "transport_error");
+      return;
+    }
+    timeoutRef.id = global.setTimeout(() => {
+      capabilities = Object.freeze({ ...capabilities, websocketLifecycle: "transport_timeout" });
+      complete(RESULT.WEBSOCKET_FAILED, "capability_failed", "transport_error");
+    }, 5000);
   }
   function testCapabilities(video) {
-    const result = { webSocketAPI: typeof global.WebSocket === "function", mediaSource: typeof global.MediaSource === "function", avcMIME: false, sourceBuffer: false, autoplay: "deferred", websocketAttempted: false, websocketAuthenticated: false, probeAckStatus: "not_attempted", terminalStatus: "capability_partial" };
+    const result = { webSocketAPI: typeof global.WebSocket === "function", mediaSource: typeof global.MediaSource === "function", avcMIME: false, sourceBuffer: false, autoplay: "deferred", websocketAttempted: false, websocketAuthenticated: false, probeAckStatus: "not_attempted", terminalStatus: "capability_partial", websocketLifecycle: "not_attempted" };
     result.avcMIME = result.mediaSource && global.MediaSource.isTypeSupported(MIME_TYPE) === true;
     const sourceBufferReady = new Promise((resolve) => {
       if (!result.avcMIME) { resolve(false); return; }
