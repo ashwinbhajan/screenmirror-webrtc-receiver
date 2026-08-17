@@ -96,11 +96,19 @@
         }
       };
       socket.onerror = () => {
+        if (capabilities.websocketAuthenticated) {
+          complete(RESULT.PASS, "capability_pass", "confirmed");
+          return;
+        }
         capabilities = Object.freeze({ ...capabilities, websocketLifecycle: opened ? "error_after_open" : "error_before_open" });
         complete(RESULT.WEBSOCKET_FAILED, "capability_failed", "transport_error");
       };
       socket.onclose = () => {
         if (!finished) {
+          if (capabilities.websocketAuthenticated) {
+            complete(RESULT.PASS, "capability_pass", "confirmed");
+            return;
+          }
           capabilities = Object.freeze({ ...capabilities, websocketLifecycle: opened ? "closed_before_auth" : "error_before_open" });
           complete(RESULT.WEBSOCKET_FAILED, "capability_failed", "transport_error");
         }
