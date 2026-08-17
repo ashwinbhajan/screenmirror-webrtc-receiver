@@ -77,12 +77,23 @@
     if (!capabilityResult()) { sendMediaResult(event.senderId, request.requestId, "unsupported"); return; }
     const video = document.getElementById("probe-video");
     const pending = []; const maxPending = 8;
-    let source; let buffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let firstRendered = false; let appendBacklogHighWatermark = 0;
-    const stop = (result) => { try { socket && socket.close(); } catch (_) {} sendMediaResult(event.senderId, request.requestId, result); };
+    let source; let buffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let firstRendered = false; let appendBacklogHighWatermark = 0; let initAppendPending = false; let initAppendTimeout;
+    const clearInitAppendTimeout = () => { if (initAppendTimeout) { global.clearTimeout(initAppendTimeout); initAppendTimeout = undefined; } };
+    const stop = (result) => { clearInitAppendTimeout(); try { socket && socket.close(); } catch (_) {} sendMediaResult(event.senderId, request.requestId, result); };
     const appendNext = () => {
       if (!buffer || buffer.updating || !pending.length) return;
       const item = pending.shift(); lastAppendingType = item.type;
-      try { buffer.appendBuffer(item.payload); } catch (_) { stop("append_failed"); }
+      if (item.type === 1) {
+        initAppendPending = true;
+        sendMediaResult(event.senderId, request.requestId, `init_append_started_len_${item.payload.byteLength}`);
+        initAppendTimeout = global.setTimeout(() => {
+          if (initAppendPending) { sendMediaResult(event.senderId, request.requestId, "init_append_timeout"); stop("append_failed"); }
+        }, 5000);
+      }
+      try { buffer.appendBuffer(item.payload); } catch (_) {
+        if (item.type === 1) sendMediaResult(event.senderId, request.requestId, "init_append_synchronous_exception");
+        stop("append_failed");
+      }
     };
     const enqueue = (item) => {
       if (pending.length >= maxPending) { pending.splice(0, pending.length - maxPending + 1); }
@@ -93,7 +104,13 @@
       source.addEventListener("sourceopen", () => {
         try {
           buffer = source.addSourceBuffer(MIME_TYPE);
+          sendMediaResult(event.senderId, request.requestId, "source_buffer_created");
           buffer.addEventListener("updateend", () => {
+            if (lastAppendingType === 1 && initAppendPending) {
+              initAppendPending = false;
+              clearInitAppendTimeout();
+              sendMediaResult(event.senderId, request.requestId, "init_append_updateend");
+            }
             if (lastAppendingType === 2) firstMediaAppended = true;
             if (firstKeyframe && firstMediaAppended && !firstRendered) {
               firstRendered = true;
@@ -108,8 +125,14 @@
             }
             appendNext();
           });
-          buffer.addEventListener("error", () => stop("append_failed"));
-          buffer.addEventListener("abort", () => stop("append_aborted"));
+          buffer.addEventListener("error", () => {
+            if (lastAppendingType === 1 && initAppendPending) sendMediaResult(event.senderId, request.requestId, "init_append_error_event");
+            stop("append_failed");
+          });
+          buffer.addEventListener("abort", () => {
+            if (lastAppendingType === 1 && initAppendPending) sendMediaResult(event.senderId, request.requestId, "init_append_abort_event");
+            stop("append_aborted");
+          });
           socket = new global.WebSocket(request.endpoint); socket.binaryType = "arraybuffer";
           socket.onopen = () => socket.send(JSON.stringify({ type: "hello", token: new URL(request.endpoint).pathname.slice(1), protocolVersion: PROTOCOL_VERSION }));
           socket.onmessage = (message) => {
@@ -125,6 +148,9 @@
           sendMediaResult(event.senderId, request.requestId, "media_socket_connecting");
         } catch (_) { stop("sourcebuffer_failed"); }
       }, { once: true });
+      source.addEventListener("sourceended", () => sendMediaResult(event.senderId, request.requestId, "media_source_state_ended"));
+      source.addEventListener("sourceclose", () => sendMediaResult(event.senderId, request.requestId, "media_source_state_closed"));
+      video.addEventListener("error", () => sendMediaResult(event.senderId, request.requestId, `media_element_error_code_${video.error ? video.error.code : 0}`));
     } catch (_) { stop("media_source_failed"); }
   }
   function parseEnvelope(value) {
