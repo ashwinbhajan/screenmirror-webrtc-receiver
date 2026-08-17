@@ -119,3 +119,29 @@ Malformed, oversized, unexpected-field, unsupported-version, invalid-ID, and
 invalid-timestamp messages are rejected. Telemetry retains only bounded event
 kind/code/timestamp counters; it never retains payloads, sender IDs, IP
 addresses, secrets, SDP, ICE candidates, or raw errors.
+
+## v2 CMAF receiver-runtime gate
+
+`v2/receiver.html` is a Debug-only **capability gate**, not a media receiver.
+Deploy it as a separate versioned Pages path and register a new unpublished
+Custom Receiver application. Do not repoint `A48EE765` or edit `/v1`.
+
+Before the physical test, configure the Debug app with:
+
+```text
+SCREEN_MIRROR_ENABLE_CMAF_RECEIVER_PROBE=1
+SCREEN_MIRROR_CMAF_RECEIVER_APPLICATION_ID=<new app ID>
+```
+
+Start a Debug broadcast first; this creates a one-client, control-only local
+`ws://` endpoint inside the Broadcast Upload Extension. In Settings, choose
+the target Cast device and run **CMAF Receiver 2D-0**. The receiver verifies
+WebSocket, MSE, `avc1.42e01f` ISO-BMFF support, SourceBuffer creation, muted
+autoplay, and exactly one token-authenticated WebSocket acknowledgement.
+
+If an HTTPS receiver blocks `ws://`, stop the WebSocket/MSE branch. Do not use
+self-signed certificates, a private CA, TLS bypasses, CSP changes, or Cast
+private APIs. A `wss://` retry is permissible only when the owner has a real
+local hostname and certificate trusted by the target Cast device. Otherwise
+hand off to the HTTP/chunked-CMAF capability evaluation; do not add media or a
+CMAF fragmenter.

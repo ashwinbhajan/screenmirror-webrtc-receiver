@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>Screen Mirror CMAF Receiver Capability Gate</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+    <script src="./receiver.js" defer></script>
+  </head>
+  <body>
+    <main class="receiver-status" aria-live="polite">
+      <p class="eyebrow">Screen Mirror · development only</p>
+      <h1>CMAF receiver capability gate</h1>
+      <dl>
+        <div><dt>Receiver version</dt><dd id="receiver-version">Loading…</dd></div>
+        <div><dt>Capability state</dt><dd id="connection-state">Starting</dd></div>
+        <div><dt>WebSocket result</dt><dd id="last-event">Not attempted</dd></div>
+      </dl>
+      <p id="status-detail" class="status-detail">No media is implemented or sent by this receiver.</p>
+      <p class="scope-note">MSE APIs are queried only. No fragments, HLS, audio, WebRTC, TLS bypass, or player load is active.</p>
+      <video id="probe-video" muted playsinline autoplay aria-hidden="true"></video>
+    </main>
+  </body>
+</html>
