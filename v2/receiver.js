@@ -96,7 +96,7 @@
         }
       };
       socket.onerror = () => {
-        capabilities = Object.freeze({ ...capabilities, websocketLifecycle: opened ? "closed_before_auth" : "error_before_open" });
+        capabilities = Object.freeze({ ...capabilities, websocketLifecycle: opened ? "error_after_open" : "error_before_open" });
         complete(RESULT.WEBSOCKET_FAILED, "capability_failed", "transport_error");
       };
       socket.onclose = () => {
