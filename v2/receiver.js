@@ -63,11 +63,91 @@
     if (!event || !event.senderId || !request) { update("Rejected", "Invalid capability probe command"); return; }
     capabilityReadyPromise.then(() => runWebSocketProbe(event.senderId, request));
   }
+  function validateMediaStart(data) {
+    const message = parse(data);
+    if (!message || Object.keys(message).length !== 4 || message.type !== "startMedia" ||
+        message.protocolVersion !== PROTOCOL_VERSION || typeof message.requestId !== "string" ||
+        !REQUEST_ID.test(message.requestId) || typeof message.endpoint !== "string" || !validEndpoint(message.endpoint)) return null;
+    return message;
+  }
+  function sendMediaResult(senderId, requestId, result) {
+    context.sendCustomMessage(NAMESPACE, senderId, { type: "mediaResult", protocolVersion: PROTOCOL_VERSION, requestId, receiverVersion: RECEIVER_VERSION, result });
+  }
+  function runMedia(event, request) {
+    if (!capabilityResult()) { sendMediaResult(event.senderId, request.requestId, "unsupported"); return; }
+    const video = document.getElementById("probe-video");
+    const pending = []; const maxPending = 8;
+    let source; let buffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let firstRendered = false; let appendBacklogHighWatermark = 0;
+    const stop = (result) => { try { socket && socket.close(); } catch (_) {} sendMediaResult(event.senderId, request.requestId, result); };
+    const appendNext = () => {
+      if (!buffer || buffer.updating || !pending.length) return;
+      const item = pending.shift(); lastAppendingType = item.type;
+      try { buffer.appendBuffer(item.payload); } catch (_) { stop("append_failed"); }
+    };
+    const enqueue = (item) => {
+      if (pending.length >= maxPending) { pending.splice(0, pending.length - maxPending + 1); }
+      pending.push(item); appendBacklogHighWatermark = Math.max(appendBacklogHighWatermark, pending.length); appendNext();
+    };
+    try {
+      source = new global.MediaSource(); video.src = global.URL.createObjectURL(source); video.muted = true; video.playsInline = true;
+      source.addEventListener("sourceopen", () => {
+        try {
+          buffer = source.addSourceBuffer(MIME_TYPE);
+          buffer.addEventListener("updateend", () => {
+            if (lastAppendingType === 2) firstMediaAppended = true;
+            if (firstKeyframe && firstMediaAppended && !firstRendered) {
+              firstRendered = true;
+              Promise.resolve(video.play()).then(() => {
+                sendMediaResult(event.senderId, request.requestId, "autoplay_started");
+                context.sendCustomMessage(NAMESPACE, event.senderId, { type: "firstRenderedFrame", protocolVersion: PROTOCOL_VERSION, requestId: request.requestId, receiverVersion: RECEIVER_VERSION, appendBacklogHighWatermark });
+              }).catch((error) => sendMediaResult(event.senderId, request.requestId, error && error.name === "NotAllowedError" ? "autoplay_blocked" : "autoplay_failed"));
+            }
+            // Keep the live edge bounded without accumulating an HLS-like buffer.
+            if (bufferedLead(video) > 1.5 && typeof buffer.remove === "function" && !buffer.updating) {
+              try { buffer.remove(0, Math.max(0, video.currentTime - 0.1)); } catch (_) {}
+            }
+            appendNext();
+          });
+          buffer.addEventListener("error", () => stop("append_failed"));
+          buffer.addEventListener("abort", () => stop("append_aborted"));
+          socket = new global.WebSocket(request.endpoint); socket.binaryType = "arraybuffer";
+          socket.onopen = () => socket.send(JSON.stringify({ type: "hello", token: new URL(request.endpoint).pathname.slice(1), protocolVersion: PROTOCOL_VERSION }));
+          socket.onmessage = (message) => {
+            if (typeof message.data === "string") {
+              const control = parse(message.data); if (!control || control.type !== "readyForMedia") { stop("protocol_error"); } return;
+            }
+            const envelope = parseEnvelope(message.data); if (!envelope) { stop("binary_envelope_invalid"); return; }
+            if (envelope.type === 1) { enqueue(envelope); return; }
+            if (envelope.type === 2) { firstKeyframe = true; enqueue(envelope); return; }
+            stop("binary_envelope_invalid");
+          };
+          socket.onerror = () => stop("websocket_failed"); socket.onclose = () => { if (!firstRendered) sendMediaResult(event.senderId, request.requestId, "websocket_closed"); };
+          sendMediaResult(event.senderId, request.requestId, "media_socket_connecting");
+        } catch (_) { stop("sourcebuffer_failed"); }
+      }, { once: true });
+    } catch (_) { stop("media_source_failed"); }
+  }
+  function parseEnvelope(value) {
+    if (!(value instanceof ArrayBuffer) || value.byteLength < 14) return null;
+    const bytes = new Uint8Array(value); const view = new DataView(value);
+    if (String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]) !== "SMC1" || bytes[4] !== 2 || (bytes[5] !== 1 && bytes[5] !== 2)) return null;
+    const length = view.getUint32(10); if (length !== bytes.length - 14 || length > 1048576) return null;
+    return { type: bytes[5], sequence: view.getUint32(6), payload: value.slice(14) };
+  }
+  function bufferedLead(video) {
+    for (let i = 0; i < video.buffered.length; i += 1) if (video.currentTime >= video.buffered.start(i) && video.currentTime <= video.buffered.end(i)) return video.buffered.end(i) - video.currentTime;
+    return 0;
+  }
+  function receiverMessage(event) {
+    const probe = event && validateProbe(event.data); if (probe) { capabilityReadyPromise.then(() => runWebSocketProbe(event.senderId, probe)); return; }
+    const media = event && validateMediaStart(event.data); if (media) { capabilityReadyPromise.then(() => runMedia(event, media)); return; }
+    update("Rejected", "Invalid v2 command");
+  }
   function runWebSocketProbe(senderId, request) {
     if (!capabilityResult()) { send(senderId, request.requestId, RESULT.FAILED); update("Unsupported", RESULT.FAILED); return; }
     let socket;
     let finished = false;
-    const timeoutRef = { id: null };
+    let timeoutRef = { id: null };
     const complete = (result, terminalStatus, probeAckStatus) => {
       if (finished) return;
       finished = true;
@@ -152,7 +232,7 @@
     capabilityReadyPromise = testCapabilities(video);
     if (!global.cast || !global.cast.framework) { update("Error", "CAF unavailable"); return; }
     context = global.cast.framework.CastReceiverContext.getInstance();
-    context.addCustomMessageListener(NAMESPACE, probeWebSocket);
+    context.addCustomMessageListener(NAMESPACE, receiverMessage);
     const options = new global.cast.framework.CastReceiverOptions();
     options.customNamespaces = { [NAMESPACE]: global.cast.framework.system.MessageType.JSON };
     context.start(options);
