@@ -70,8 +70,10 @@
         !REQUEST_ID.test(message.requestId) || typeof message.endpoint !== "string" || !validEndpoint(message.endpoint)) return null;
     return message;
   }
-  function sendMediaResult(senderId, requestId, result) {
-    context.sendCustomMessage(NAMESPACE, senderId, { type: "mediaResult", protocolVersion: PROTOCOL_VERSION, requestId, receiverVersion: RECEIVER_VERSION, result });
+  function sendMediaResult(senderId, requestId, result, telemetry) {
+    const payload = { type: "mediaResult", protocolVersion: PROTOCOL_VERSION, requestId, receiverVersion: RECEIVER_VERSION, result };
+    if (telemetry) payload.telemetry = telemetry;
+    context.sendCustomMessage(NAMESPACE, senderId, payload);
   }
   function runMedia(event, request) {
     if (!capabilityResult()) { sendMediaResult(event.senderId, request.requestId, "unsupported"); return; }
@@ -79,7 +81,7 @@
     document.body.classList.add("media-active");
     update("Media", "Waiting for the first decodable video frame");
     const pending = []; const maxPending = 8;
-    let source; let buffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let firstRendered = false; let playAttempted = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let playTimeout;
+    let source; let buffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let firstRendered = false; let playAttempted = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let playTimeout;
     const clearInitAppendTimeout = () => { if (initAppendTimeout) { global.clearTimeout(initAppendTimeout); initAppendTimeout = undefined; } };
     const clearPlayTimeout = () => { if (playTimeout) { global.clearTimeout(playTimeout); playTimeout = undefined; } };
     const stop = (result) => { clearInitAppendTimeout(); clearPlayTimeout(); try { socket && socket.close(); } catch (_) {} sendMediaResult(event.senderId, request.requestId, result); };
@@ -89,14 +91,41 @@
       if (error && error.name === "AbortError") return "play_rejected_abort";
       return "play_rejected_other";
     };
+    const boundedMs = (value) => Number.isFinite(value) && value >= 0 && value <= 3600 ? Math.round(value * 1000) : null;
+    const playbackTelemetry = (checkpoint) => {
+      const ranges = video.buffered;
+      const hasRange = ranges && ranges.length > 0;
+      const durationKind = Number.isNaN(video.duration) ? "nan" : video.duration === Infinity ? "infinite" : Number.isFinite(video.duration) ? "finite" : "unknown";
+      sendMediaResult(event.senderId, request.requestId, "playback_state", {
+        checkpoint,
+        readyState: Math.max(0, Math.min(4, video.readyState || 0)),
+        networkState: Math.max(0, Math.min(3, video.networkState || 0)),
+        paused: !!video.paused,
+        ended: !!video.ended,
+        currentTimeMs: boundedMs(video.currentTime) || 0,
+        durationKind,
+        bufferedLength: Math.max(0, Math.min(8, hasRange ? ranges.length : 0)),
+        bufferStartMs: hasRange ? boundedMs(ranges.start(0)) : null,
+        bufferEndMs: hasRange ? boundedMs(ranges.end(0)) : null,
+        mediaSourceState: source && ["open", "ended", "closed"].includes(source.readyState) ? source.readyState : "unknown",
+        sourceBufferUpdating: !!(buffer && buffer.updating),
+        appendedFragments,
+        keyframeAppended: firstKeyframe && firstMediaAppended,
+        queueDepth: Math.max(0, Math.min(8, pending.length))
+      });
+    };
     const attemptPlay = () => {
       if (playAttempted || !firstKeyframe || !firstMediaAppended || !buffer || buffer.updating) return;
       playAttempted = true;
+      playbackTelemetry("before_play");
       sendMediaResult(event.senderId, request.requestId, "play_attempt_started");
       let promise;
       try { promise = video.play(); } catch (_) { sendMediaResult(event.senderId, request.requestId, "play_synchronous_exception"); return; }
       sendMediaResult(event.senderId, request.requestId, "play_promise_pending");
-      playTimeout = global.setTimeout(() => sendMediaResult(event.senderId, request.requestId, "play_pending_timeout"), 5000);
+      playTimeout = global.setTimeout(() => {
+        playbackTelemetry("play_pending_timeout");
+        sendMediaResult(event.senderId, request.requestId, "play_pending_timeout");
+      }, 5000);
       Promise.resolve(promise).then(() => {
         clearPlayTimeout();
         sendMediaResult(event.senderId, request.requestId, "play_promise_resolved");
@@ -144,7 +173,9 @@
             if (lastAppendingType === 2) firstMediaAppended = true;
             if (lastAppendingType === 2 && mediaAppendPending) {
               mediaAppendPending = false;
+              appendedFragments += 1;
               sendMediaResult(event.senderId, request.requestId, "media_append_updateend");
+              playbackTelemetry("first_media_append");
             }
             attemptPlay();
             // Keep the live edge bounded without accumulating an HLS-like buffer.
