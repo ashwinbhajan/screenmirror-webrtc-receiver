@@ -81,7 +81,7 @@
     document.body.classList.add("media-active");
     update("Media", "Waiting for the first decodable video frame");
     const pending = []; const maxPending = 8;
-    let source; let buffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let firstRendered = false; let playAttempted = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let playTimeout;
+    let source; let buffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let firstRendered = false; let playAttempted = false; let initialSeekRequested = false; let initialSeekCompleted = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let playTimeout;
     const clearInitAppendTimeout = () => { if (initAppendTimeout) { global.clearTimeout(initAppendTimeout); initAppendTimeout = undefined; } };
     const clearPlayTimeout = () => { if (playTimeout) { global.clearTimeout(playTimeout); playTimeout = undefined; } };
     const stop = (result) => { clearInitAppendTimeout(); clearPlayTimeout(); try { socket && socket.close(); } catch (_) {} sendMediaResult(event.senderId, request.requestId, result); };
@@ -115,7 +115,7 @@
       });
     };
     const attemptPlay = () => {
-      if (playAttempted || !firstKeyframe || !firstMediaAppended || !buffer || buffer.updating) return;
+      if (playAttempted || !initialSeekCompleted || !firstKeyframe || !firstMediaAppended || !buffer || buffer.updating) return;
       playAttempted = true;
       playbackTelemetry("before_play");
       sendMediaResult(event.senderId, request.requestId, "play_attempt_started");
@@ -133,6 +133,21 @@
         clearPlayTimeout();
         sendMediaResult(event.senderId, request.requestId, safePlayRejection(error));
       });
+    };
+    const ensurePlayablePosition = () => {
+      if (initialSeekRequested || !firstKeyframe || !firstMediaAppended || !buffer || buffer.updating || !video.buffered || !video.buffered.length) return;
+      const start = video.buffered.start(0);
+      const end = video.buffered.end(0);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return;
+      if (video.currentTime >= start && video.currentTime <= end) {
+        initialSeekCompleted = true;
+        attemptPlay();
+        return;
+      }
+      initialSeekRequested = true;
+      const target = start + Math.min(0.05, Math.max(0, (end - start) / 2));
+      sendMediaResult(event.senderId, request.requestId, "initial_seek_requested");
+      try { video.currentTime = target; } catch (_) { sendMediaResult(event.senderId, request.requestId, "initial_seek_failed"); }
     };
     const appendNext = () => {
       if (!buffer || buffer.updating || !pending.length) return;
@@ -177,6 +192,7 @@
               sendMediaResult(event.senderId, request.requestId, "media_append_updateend");
               playbackTelemetry("first_media_append");
             }
+            ensurePlayablePosition();
             attemptPlay();
             // Keep the live edge bounded without accumulating an HLS-like buffer.
             if (bufferedLead(video) > 1.5 && typeof buffer.remove === "function" && !buffer.updating) {
@@ -227,6 +243,14 @@
       video.addEventListener("canplaythrough", () => sendMediaResult(event.senderId, request.requestId, "media_event_canplaythrough"));
       video.addEventListener("waiting", () => sendMediaResult(event.senderId, request.requestId, "media_event_waiting"));
       video.addEventListener("stalled", () => sendMediaResult(event.senderId, request.requestId, "media_event_stalled"));
+      video.addEventListener("seeking", () => sendMediaResult(event.senderId, request.requestId, "initial_seek_started"));
+      video.addEventListener("seeked", () => {
+        if (!initialSeekRequested) return;
+        initialSeekCompleted = true;
+        playbackTelemetry("before_play");
+        sendMediaResult(event.senderId, request.requestId, "initial_seek_completed");
+        attemptPlay();
+      });
       video.addEventListener("playing", () => {
         sendMediaResult(event.senderId, request.requestId, "media_event_playing");
         if (!firstRendered && firstMediaAppended) {
