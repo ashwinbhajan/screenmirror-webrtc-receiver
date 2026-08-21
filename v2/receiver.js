@@ -101,6 +101,7 @@
     document.body.classList.add("media-active");
     update("Media", "Waiting for the first decodable video frame");
     const pending = []; const maxPending = 8;
+    const flowGeneration = 1; const initialCredits = 8; let mediaReadySent = false;
     let source; let buffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let firstRendered = false; let playAttempted = false; let initialSeekRequested = false; let initialSeekCompleted = false; let recoverySeekPending = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let playTimeout;
     const latencyCorrelations = new Map(); let latencyFallback = false;
     const sendLatency = (value) => { try { if (socket && socket.readyState === 1) socket.send(JSON.stringify(value)); } catch (_) {} };
@@ -230,12 +231,14 @@
               initAppendPending = false;
               clearInitAppendTimeout();
               sendMediaResult(event.senderId, request.requestId, "init_append_updateend");
+              if (!mediaReadySent) { mediaReadySent = true; sendLatency({ type: "mediaReady", protocolVersion: PROTOCOL_VERSION, generation: flowGeneration, initialCredits }); }
             }
             if (lastAppendingType === 2) firstMediaAppended = true;
             if (lastAppendingType === 2 && mediaAppendPending) {
               mediaAppendPending = false;
               appendedFragments += 1;
               sendMediaResult(event.senderId, request.requestId, "media_append_updateend");
+              if (mediaReadySent) sendLatency({ type: "mediaCredit", protocolVersion: PROTOCOL_VERSION, generation: flowGeneration, credits: 1 });
               playbackTelemetry("first_media_append");
             }
             ensurePlayablePosition();
