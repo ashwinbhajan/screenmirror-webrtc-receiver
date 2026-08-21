@@ -102,6 +102,18 @@
     update("Media", "Waiting for the first decodable video frame");
     const pending = []; const maxPending = 8;
     let source; let buffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let firstRendered = false; let playAttempted = false; let initialSeekRequested = false; let initialSeekCompleted = false; let recoverySeekPending = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let playTimeout;
+    const latencyCorrelations = new Map(); let latencyFallback = false;
+    const sendLatency = (value) => { try { if (socket && socket.readyState === 1) socket.send(JSON.stringify(value)); } catch (_) {} };
+    const observeFrame = (now, metadata) => {
+      let nearest = null;
+      for (const item of latencyCorrelations.values()) { const distance = Math.abs(item.mediaTime - metadata.mediaTime); if (distance <= 0.05 && (!nearest || distance < nearest.distance)) nearest = { ...item, distance }; }
+      if (!nearest) return; latencyCorrelations.delete(nearest.sequence);
+      sendLatency({ type: "renderedFrame", generation: nearest.generation, sequence: nearest.sequence, receiverTimeMs: now, mediaTimeMs: Math.round(metadata.mediaTime * 1000), presentedFrames: Number.isFinite(metadata.presentedFrames) ? metadata.presentedFrames : 0, bufferLeadMs: Math.round(bufferedLead(video) * 1000) });
+    };
+    const installFrameObserver = () => {
+      if (typeof video.requestVideoFrameCallback === "function") { sendLatency({ type: "latencyCapability", mode: "requestVideoFrameCallback" }); const next = (now, metadata) => { observeFrame(now, metadata); video.requestVideoFrameCallback(next); }; video.requestVideoFrameCallback(next); }
+      else { latencyFallback = true; sendLatency({ type: "latencyCapability", mode: "playbackAckFallback" }); }
+    };
     const clearInitAppendTimeout = () => { if (initAppendTimeout) { global.clearTimeout(initAppendTimeout); initAppendTimeout = undefined; } };
     const clearPlayTimeout = () => { if (playTimeout) { global.clearTimeout(playTimeout); playTimeout = undefined; } };
     const stop = (result) => { clearInitAppendTimeout(); clearPlayTimeout(); try { socket && socket.close(); } catch (_) {} sendMediaResult(event.senderId, request.requestId, result); };
@@ -249,10 +261,14 @@
             stop("append_aborted");
           });
           socket = new global.WebSocket(request.endpoint); socket.binaryType = "arraybuffer";
-          socket.onopen = () => socket.send(JSON.stringify({ type: "hello", token: new URL(request.endpoint).pathname.slice(1), protocolVersion: PROTOCOL_VERSION }));
+          socket.onopen = () => { socket.send(JSON.stringify({ type: "hello", token: new URL(request.endpoint).pathname.slice(1), protocolVersion: PROTOCOL_VERSION })); installFrameObserver(); };
           socket.onmessage = (message) => {
             if (typeof message.data === "string") {
-              const control = parse(message.data); if (!control || control.type !== "readyForMedia") { stop("protocol_error"); } return;
+              const control = parse(message.data); if (!control) { stop("protocol_error"); return; }
+              if (control.type === "readyForMedia") return;
+              if (control.type === "clockPing" && Number.isFinite(control.t1) && Number.isInteger(control.sequence)) { const t2 = performance.now(); sendLatency({ type: "clockPong", sequence: control.sequence, t1: control.t1, t2, t3: performance.now() }); return; }
+              if (control.type === "frameCorrelation" && Number.isInteger(control.generation) && Number.isInteger(control.sequence) && Number.isFinite(control.mediaTimeMs)) { if (latencyCorrelations.size >= 256) latencyCorrelations.delete(latencyCorrelations.keys().next().value); latencyCorrelations.set(control.sequence, { generation: control.generation, sequence: control.sequence, mediaTime: control.mediaTimeMs / 1000 }); return; }
+              stop("protocol_error"); return;
             }
             const envelope = parseEnvelope(message.data); if (!envelope) { stop("binary_envelope_invalid"); return; }
             if (envelope.type === 1) { enqueue(envelope); return; }
@@ -304,6 +320,7 @@
       });
       video.addEventListener("timeupdate", () => {
         if (!timeUpdated) { timeUpdated = true; sendMediaResult(event.senderId, request.requestId, "media_event_timeupdate"); }
+        if (latencyFallback && latencyCorrelations.size) { const mediaTime = video.currentTime; const nearest = Array.from(latencyCorrelations.values()).sort((a, b) => Math.abs(a.mediaTime - mediaTime) - Math.abs(b.mediaTime - mediaTime))[0]; if (nearest && Math.abs(nearest.mediaTime - mediaTime) <= 0.05) { latencyCorrelations.delete(nearest.sequence); sendLatency({ type: "renderedFrame", generation: nearest.generation, sequence: nearest.sequence, receiverTimeMs: performance.now(), mediaTimeMs: Math.round(mediaTime * 1000), presentedFrames: 0, bufferLeadMs: Math.round(bufferedLead(video) * 1000), fallback: true }); } }
       });
     } catch (_) { stop("media_source_failed"); }
   }
