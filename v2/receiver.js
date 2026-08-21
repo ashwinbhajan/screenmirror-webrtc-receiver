@@ -55,6 +55,10 @@
   function capabilityResult() {
     return capabilities.webSocketAPI && capabilities.mediaSource && capabilities.avcMIME && capabilities.sourceBuffer;
   }
+  function recoverySeekTarget(currentTime, start, end) {
+    if (!Number.isFinite(currentTime) || !Number.isFinite(start) || !Number.isFinite(end) || end <= start || currentTime >= start) return null;
+    return start + Math.min(0.05, Math.max(0, (end - start) / 2));
+  }
   function send(senderId, requestId, result) {
     context.sendCustomMessage(NAMESPACE, senderId, makeResult(requestId, result));
   }
@@ -81,7 +85,7 @@
     document.body.classList.add("media-active");
     update("Media", "Waiting for the first decodable video frame");
     const pending = []; const maxPending = 8;
-    let source; let buffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let firstRendered = false; let playAttempted = false; let initialSeekRequested = false; let initialSeekCompleted = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let playTimeout;
+    let source; let buffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let firstRendered = false; let playAttempted = false; let initialSeekRequested = false; let initialSeekCompleted = false; let recoverySeekPending = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let playTimeout;
     const clearInitAppendTimeout = () => { if (initAppendTimeout) { global.clearTimeout(initAppendTimeout); initAppendTimeout = undefined; } };
     const clearPlayTimeout = () => { if (playTimeout) { global.clearTimeout(playTimeout); playTimeout = undefined; } };
     const stop = (result) => { clearInitAppendTimeout(); clearPlayTimeout(); try { socket && socket.close(); } catch (_) {} sendMediaResult(event.senderId, request.requestId, result); };
@@ -149,6 +153,14 @@
       sendMediaResult(event.senderId, request.requestId, "initial_seek_requested");
       try { video.currentTime = target; } catch (_) { sendMediaResult(event.senderId, request.requestId, "initial_seek_failed"); }
     };
+    const recoverPlaybackPosition = () => {
+      if (!initialSeekCompleted || recoverySeekPending || !firstRendered || !buffer || buffer.updating || !video.buffered || !video.buffered.length) return;
+      const target = recoverySeekTarget(video.currentTime, video.buffered.start(0), video.buffered.end(0));
+      if (target === null) return;
+      recoverySeekPending = true;
+      sendMediaResult(event.senderId, request.requestId, "recovery_seek_requested");
+      try { video.currentTime = target; } catch (_) { recoverySeekPending = false; sendMediaResult(event.senderId, request.requestId, "recovery_seek_failed"); }
+    };
     const appendNext = () => {
       if (!buffer || buffer.updating || !pending.length) return;
       const item = pending.shift(); lastAppendingType = item.type;
@@ -194,6 +206,7 @@
             }
             ensurePlayablePosition();
             attemptPlay();
+            recoverPlaybackPosition();
             // Keep the live edge bounded without accumulating an HLS-like buffer.
             if (bufferedLead(video) > 1.5 && typeof buffer.remove === "function" && !buffer.updating) {
               try { buffer.remove(0, Math.max(0, video.currentTime - 0.1)); } catch (_) {}
@@ -243,8 +256,14 @@
       video.addEventListener("canplaythrough", () => sendMediaResult(event.senderId, request.requestId, "media_event_canplaythrough"));
       video.addEventListener("waiting", () => sendMediaResult(event.senderId, request.requestId, "media_event_waiting"));
       video.addEventListener("stalled", () => sendMediaResult(event.senderId, request.requestId, "media_event_stalled"));
-      video.addEventListener("seeking", () => sendMediaResult(event.senderId, request.requestId, "initial_seek_started"));
+      video.addEventListener("seeking", () => sendMediaResult(event.senderId, request.requestId, recoverySeekPending ? "recovery_seek_started" : "initial_seek_started"));
       video.addEventListener("seeked", () => {
+        if (recoverySeekPending) {
+          recoverySeekPending = false;
+          sendMediaResult(event.senderId, request.requestId, "recovery_seek_completed");
+          try { Promise.resolve(video.play()).catch((error) => sendMediaResult(event.senderId, request.requestId, safePlayRejection(error))); } catch (_) { sendMediaResult(event.senderId, request.requestId, "recovery_play_synchronous_exception"); }
+          return;
+        }
         if (!initialSeekRequested) return;
         initialSeekCompleted = true;
         playbackTelemetry("before_play");
@@ -396,6 +415,6 @@
     context.start(options);
     update("Checking", "Testing receiver capabilities before one endpoint probe");
   }
-  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ MIME_TYPE, RESULT, validEndpoint, validateProbe, capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }) });
+  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }) });
   if (typeof document !== "undefined") document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", boot, { once: true }) : boot();
 })(globalThis);
