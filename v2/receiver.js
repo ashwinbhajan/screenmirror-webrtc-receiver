@@ -6,6 +6,8 @@
   const NAMESPACE = "urn:x-cast:com.ashwinbhajan.screenmirror.cmafprobe.v2";
   const MIME_TYPE = 'video/mp4; codecs="avc1.42e01f"';
   const MAX_MESSAGE_BYTES = 1024;
+  const RETAINED_HISTORY_SECONDS = 2.5;
+  const TRIM_HISTORY_THRESHOLD_SECONDS = 4;
   const REQUEST_ID = /^[A-Za-z0-9._-]{1,64}$/;
   const RESULT = Object.freeze({
     PASS: "capability_pass",
@@ -58,6 +60,11 @@
   function recoverySeekTarget(currentTime, start, end) {
     if (!Number.isFinite(currentTime) || !Number.isFinite(start) || !Number.isFinite(end) || end <= start || currentTime >= start) return null;
     return start + Math.min(0.05, Math.max(0, (end - start) / 2));
+  }
+  function bufferedTrimEnd(currentTime, start, end) {
+    if (!Number.isFinite(currentTime) || !Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
+    if (currentTime - start <= TRIM_HISTORY_THRESHOLD_SECONDS || end - currentTime < 0.5) return null;
+    return Math.max(0, currentTime - RETAINED_HISTORY_SECONDS);
   }
   function send(senderId, requestId, result) {
     context.sendCustomMessage(NAMESPACE, senderId, makeResult(requestId, result));
@@ -207,9 +214,11 @@
             ensurePlayablePosition();
             attemptPlay();
             recoverPlaybackPosition();
-            // Keep the live edge bounded without accumulating an HLS-like buffer.
-            if (bufferedLead(video) > 1.5 && typeof buffer.remove === "function" && !buffer.updating) {
-              try { buffer.remove(0, Math.max(0, video.currentTime - 0.1)); } catch (_) {}
+            // Preserve a full GOP behind the playhead. Trimming at 0.1 seconds
+            // can evict the current decode dependency and force a recovery seek.
+            const trimEnd = video.buffered.length ? bufferedTrimEnd(video.currentTime, video.buffered.start(0), video.buffered.end(0)) : null;
+            if (trimEnd !== null && typeof buffer.remove === "function" && !buffer.updating) {
+              try { buffer.remove(0, trimEnd); } catch (_) {}
             }
             appendNext();
           });
@@ -415,6 +424,6 @@
     context.start(options);
     update("Checking", "Testing receiver capabilities before one endpoint probe");
   }
-  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }) });
+  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, bufferedTrimEnd, capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }) });
   if (typeof document !== "undefined") document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", boot, { once: true }) : boot();
 })(globalThis);
