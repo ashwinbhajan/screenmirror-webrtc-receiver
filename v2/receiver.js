@@ -8,6 +8,9 @@
   const MAX_MESSAGE_BYTES = 1024;
   const RETAINED_HISTORY_SECONDS = 2.5;
   const TRIM_HISTORY_THRESHOLD_SECONDS = 4;
+  const LIVE_EDGE_FAST_THRESHOLD_SECONDS = 1.25;
+  const LIVE_EDGE_NORMAL_THRESHOLD_SECONDS = 0.75;
+  const LIVE_EDGE_FAST_PLAYBACK_RATE = 1.2;
   const REQUEST_ID = /^[A-Za-z0-9._-]{1,64}$/;
   const RESULT = Object.freeze({
     PASS: "capability_pass",
@@ -65,6 +68,12 @@
     if (!Number.isFinite(currentTime) || !Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
     if (currentTime - start <= TRIM_HISTORY_THRESHOLD_SECONDS || end - currentTime < 0.5) return null;
     return Math.max(0, currentTime - RETAINED_HISTORY_SECONDS);
+  }
+  function liveEdgePlaybackRate(lead, currentRate) {
+    if (!Number.isFinite(lead) || !Number.isFinite(currentRate)) return null;
+    if (lead >= LIVE_EDGE_FAST_THRESHOLD_SECONDS) return LIVE_EDGE_FAST_PLAYBACK_RATE;
+    if (currentRate > 1 && lead <= LIVE_EDGE_NORMAL_THRESHOLD_SECONDS) return 1;
+    return null;
   }
   function send(senderId, requestId, result) {
     context.sendCustomMessage(NAMESPACE, senderId, makeResult(requestId, result));
@@ -168,6 +177,12 @@
       sendMediaResult(event.senderId, request.requestId, "recovery_seek_requested");
       try { video.currentTime = target; } catch (_) { recoverySeekPending = false; sendMediaResult(event.senderId, request.requestId, "recovery_seek_failed"); }
     };
+    const regulateLiveEdge = () => {
+      const nextRate = liveEdgePlaybackRate(bufferedLead(video), video.playbackRate);
+      if (nextRate === null || nextRate === video.playbackRate) return;
+      video.playbackRate = nextRate;
+      sendMediaResult(event.senderId, request.requestId, nextRate > 1 ? "live_edge_catchup_enabled" : "live_edge_catchup_disabled");
+    };
     const appendNext = () => {
       if (!buffer || buffer.updating || !pending.length) return;
       const item = pending.shift(); lastAppendingType = item.type;
@@ -214,6 +229,7 @@
             ensurePlayablePosition();
             attemptPlay();
             recoverPlaybackPosition();
+            regulateLiveEdge();
             // Preserve a full GOP behind the playhead. Trimming at 0.1 seconds
             // can evict the current decode dependency and force a recovery seek.
             const trimEnd = video.buffered.length ? bufferedTrimEnd(video.currentTime, video.buffered.start(0), video.buffered.end(0)) : null;
@@ -424,6 +440,6 @@
     context.start(options);
     update("Checking", "Testing receiver capabilities before one endpoint probe");
   }
-  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, bufferedTrimEnd, capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }) });
+  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }) });
   if (typeof document !== "undefined") document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", boot, { once: true }) : boot();
 })(globalThis);
