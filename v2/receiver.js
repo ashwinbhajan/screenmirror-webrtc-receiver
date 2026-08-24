@@ -81,6 +81,9 @@
         !Number.isFinite(bufferLeadMs) || bufferLeadMs < 0 || !Number.isInteger(pendingDepth) || pendingDepth < 0 || pendingDepth > 8) return null;
     return { type: "latencyStage", generation, sequence, stage, receiverTimeMs, bufferLeadMs, pendingDepth };
   }
+  function canConfirmFirstRendered(firstRendered, firstMediaAppended, metadata) {
+    return !firstRendered && firstMediaAppended && Number.isFinite(metadata && metadata.presentedFrames) && metadata.presentedFrames > 0;
+  }
   function send(senderId, requestId, result) {
     context.sendCustomMessage(NAMESPACE, senderId, makeResult(requestId, result));
   }
@@ -127,7 +130,15 @@
     // Each runMedia call owns one receiver generation/session, so this counter
     // resets when that session is replaced while remaining monotonic in-session.
     const emitMediaCredit = createMediaCreditEmitter(flowGeneration, sendLatency);
+    const confirmFirstRendered = (metadata) => {
+      if (!canConfirmFirstRendered(firstRendered, firstMediaAppended, metadata)) return;
+      firstRendered = true;
+      const presentedFrames = Math.max(1, Math.floor(metadata.presentedFrames));
+      sendMediaResult(event.senderId, request.requestId, `first_frame_callback_presented_${presentedFrames}`);
+      context.sendCustomMessage(NAMESPACE, event.senderId, { type: "firstRenderedFrame", protocolVersion: PROTOCOL_VERSION, requestId: request.requestId, receiverVersion: RECEIVER_VERSION, appendBacklogHighWatermark });
+    };
     const observeFrame = (now, metadata) => {
+      confirmFirstRendered(metadata);
       let nearest = null;
       for (const item of latencyCorrelations.values()) { const distance = Math.abs(item.mediaTime - metadata.mediaTime); if (distance <= 0.05 && (!nearest || distance < nearest.distance)) nearest = { ...item, distance }; }
       if (!nearest) return; latencyCorrelations.delete(nearest.sequence);
@@ -345,10 +356,6 @@
       });
       video.addEventListener("playing", () => {
         sendMediaResult(event.senderId, request.requestId, "media_event_playing");
-        if (!firstRendered && firstMediaAppended) {
-          firstRendered = true;
-          context.sendCustomMessage(NAMESPACE, event.senderId, { type: "firstRenderedFrame", protocolVersion: PROTOCOL_VERSION, requestId: request.requestId, receiverVersion: RECEIVER_VERSION, appendBacklogHighWatermark });
-        }
       });
       video.addEventListener("timeupdate", () => {
         if (!timeUpdated) { timeUpdated = true; sendMediaResult(event.senderId, request.requestId, "media_event_timeupdate"); }
@@ -489,6 +496,6 @@
     context.start(options);
     update("Checking", "Testing receiver capabilities before one endpoint probe");
   }
-  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, makeLatencyStage, createMediaCreditEmitter, capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }) });
+  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, makeLatencyStage, canConfirmFirstRendered, createMediaCreditEmitter, capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }) });
   if (typeof document !== "undefined") document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", boot, { once: true }) : boot();
 })(globalThis);
