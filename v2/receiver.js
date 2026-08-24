@@ -111,9 +111,13 @@
     update("Media", "Waiting for the first decodable video frame");
     const pending = []; const maxPending = 8;
     const flowGeneration = 1; const initialCredits = 8; let mediaReadySent = false;
-    let source; let buffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let firstRendered = false; let playAttempted = false; let initialSeekRequested = false; let initialSeekCompleted = false; let recoverySeekPending = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let playTimeout;
+    let source; let buffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let lastAppendingSequence = 0; let firstRendered = false; let playAttempted = false; let initialSeekRequested = false; let initialSeekCompleted = false; let recoverySeekPending = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let playTimeout;
     const latencyCorrelations = new Map(); let latencyFallback = false;
     const sendLatency = (value) => { try { if (socket && socket.readyState === 1) socket.send(JSON.stringify(value)); } catch (_) {} };
+    const sendLatencyStage = (stage, sequence) => {
+      if (!Number.isInteger(sequence) || sequence <= 0) return;
+      sendLatency({ type: "latencyStage", generation: flowGeneration, sequence, stage, receiverTimeMs: performance.now(), bufferLeadMs: Math.round(bufferedLead(video) * 1000), pendingDepth: Math.max(0, Math.min(maxPending, pending.length)) });
+    };
     const emitMediaCredit = createMediaCreditEmitter(flowGeneration, sendLatency);
     const observeFrame = (now, metadata) => {
       let nearest = null;
@@ -208,7 +212,7 @@
     };
     const appendNext = () => {
       if (!buffer || buffer.updating || !pending.length) return;
-      const item = pending.shift(); lastAppendingType = item.type;
+      const item = pending.shift(); lastAppendingType = item.type; lastAppendingSequence = item.correlationSequence || 0;
       if (item.type === 1) {
         initAppendPending = true;
         sendMediaResult(event.senderId, request.requestId, `init_append_started_len_${item.payload.byteLength}`);
@@ -218,6 +222,7 @@
       }
       if (item.type === 2) {
         mediaAppendPending = true;
+        sendLatencyStage("append_started", lastAppendingSequence);
         sendMediaResult(event.senderId, request.requestId, `media_append_started_len_${item.payload.byteLength}`);
       }
       try { buffer.appendBuffer(item.payload); } catch (_) {
@@ -247,6 +252,7 @@
             if (lastAppendingType === 2 && mediaAppendPending) {
               mediaAppendPending = false;
               appendedFragments += 1;
+              sendLatencyStage("append_ended", lastAppendingSequence);
               sendMediaResult(event.senderId, request.requestId, "media_append_updateend");
               if (mediaReadySent) emitMediaCredit();
               playbackTelemetry("first_media_append");
@@ -287,13 +293,18 @@
             if (envelope.type === 1) { enqueue(envelope); return; }
             if (envelope.type === 2) {
               const summary = summarizeFragment(envelope.payload);
+              let correlationSequence = 0;
               if (summary) {
+                for (const item of latencyCorrelations.values()) {
+                  if (Math.abs(item.mediaTime - summary.decodeTime / 90000) <= 0.001) { correlationSequence = item.sequence; break; }
+                }
+                sendLatencyStage("received", correlationSequence);
                 sendMediaResult(event.senderId, request.requestId, `media_fragment_received_len_${envelope.payload.byteLength}`);
                 sendMediaResult(event.senderId, request.requestId, `first_fragment_seq_${summary.sequence}_samples_${summary.sampleCount}_tfdt_${summary.decodeTime}_offset_${summary.dataOffset}_payload_${summary.payloadLength}_nal_${summary.firstNALType}`);
               } else {
                 sendMediaResult(event.senderId, request.requestId, "media_fragment_layout_invalid");
               }
-              firstKeyframe = true; enqueue(envelope); return;
+              firstKeyframe = true; enqueue({ ...envelope, correlationSequence }); return;
             }
             stop("binary_envelope_invalid");
           };
