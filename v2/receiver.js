@@ -124,6 +124,8 @@
       const message = makeLatencyStage(flowGeneration, sequence, stage, performance.now(), Math.round(bufferedLead(video) * 1000), Math.max(0, Math.min(maxPending, pending.length)));
       if (message) sendLatency(message);
     };
+    // Each runMedia call owns one receiver generation/session, so this counter
+    // resets when that session is replaced while remaining monotonic in-session.
     const emitMediaCredit = createMediaCreditEmitter(flowGeneration, sendLatency);
     const observeFrame = (now, metadata) => {
       let nearest = null;
