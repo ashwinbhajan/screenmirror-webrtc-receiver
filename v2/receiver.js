@@ -75,6 +75,12 @@
     if (currentRate > 1 && lead <= LIVE_EDGE_NORMAL_THRESHOLD_SECONDS) return 1;
     return null;
   }
+  function makeLatencyStage(generation, sequence, stage, receiverTimeMs, bufferLeadMs, pendingDepth) {
+    if (!Number.isInteger(generation) || generation <= 0 || !Number.isInteger(sequence) || sequence <= 0 ||
+        !["received", "append_started", "append_ended"].includes(stage) || !Number.isFinite(receiverTimeMs) || receiverTimeMs < 0 ||
+        !Number.isFinite(bufferLeadMs) || bufferLeadMs < 0 || !Number.isInteger(pendingDepth) || pendingDepth < 0 || pendingDepth > 8) return null;
+    return { type: "latencyStage", generation, sequence, stage, receiverTimeMs, bufferLeadMs, pendingDepth };
+  }
   function send(senderId, requestId, result) {
     context.sendCustomMessage(NAMESPACE, senderId, makeResult(requestId, result));
   }
@@ -115,8 +121,8 @@
     const latencyCorrelations = new Map(); let latencyFallback = false;
     const sendLatency = (value) => { try { if (socket && socket.readyState === 1) socket.send(JSON.stringify(value)); } catch (_) {} };
     const sendLatencyStage = (stage, sequence) => {
-      if (!Number.isInteger(sequence) || sequence <= 0) return;
-      sendLatency({ type: "latencyStage", generation: flowGeneration, sequence, stage, receiverTimeMs: performance.now(), bufferLeadMs: Math.round(bufferedLead(video) * 1000), pendingDepth: Math.max(0, Math.min(maxPending, pending.length)) });
+      const message = makeLatencyStage(flowGeneration, sequence, stage, performance.now(), Math.round(bufferedLead(video) * 1000), Math.max(0, Math.min(maxPending, pending.length)));
+      if (message) sendLatency(message);
     };
     const emitMediaCredit = createMediaCreditEmitter(flowGeneration, sendLatency);
     const observeFrame = (now, metadata) => {
@@ -481,6 +487,6 @@
     context.start(options);
     update("Checking", "Testing receiver capabilities before one endpoint probe");
   }
-  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, createMediaCreditEmitter, capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }) });
+  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, makeLatencyStage, createMediaCreditEmitter, capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }) });
   if (typeof document !== "undefined") document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", boot, { once: true }) : boot();
 })(globalThis);
