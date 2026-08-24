@@ -95,6 +95,15 @@
     if (telemetry) payload.telemetry = telemetry;
     context.sendCustomMessage(NAMESPACE, senderId, payload);
   }
+  function createMediaCreditEmitter(generation, send) {
+    let creditSequence = 0;
+    return () => {
+      creditSequence += 1;
+      const credit = { type: "mediaCredit", protocolVersion: PROTOCOL_VERSION, generation, credits: 1, creditSequence };
+      if (global.console && typeof global.console.info === "function") global.console.info("ScreenMirror mediaCredit", { generation, creditSequence });
+      send(credit);
+    };
+  }
   function runMedia(event, request) {
     if (!capabilityResult()) { sendMediaResult(event.senderId, request.requestId, "unsupported"); return; }
     const video = document.getElementById("probe-video");
@@ -105,6 +114,7 @@
     let source; let buffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let firstRendered = false; let playAttempted = false; let initialSeekRequested = false; let initialSeekCompleted = false; let recoverySeekPending = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let playTimeout;
     const latencyCorrelations = new Map(); let latencyFallback = false;
     const sendLatency = (value) => { try { if (socket && socket.readyState === 1) socket.send(JSON.stringify(value)); } catch (_) {} };
+    const emitMediaCredit = createMediaCreditEmitter(flowGeneration, sendLatency);
     const observeFrame = (now, metadata) => {
       let nearest = null;
       for (const item of latencyCorrelations.values()) { const distance = Math.abs(item.mediaTime - metadata.mediaTime); if (distance <= 0.05 && (!nearest || distance < nearest.distance)) nearest = { ...item, distance }; }
@@ -238,7 +248,7 @@
               mediaAppendPending = false;
               appendedFragments += 1;
               sendMediaResult(event.senderId, request.requestId, "media_append_updateend");
-              if (mediaReadySent) sendLatency({ type: "mediaCredit", protocolVersion: PROTOCOL_VERSION, generation: flowGeneration, credits: 1 });
+              if (mediaReadySent) emitMediaCredit();
               playbackTelemetry("first_media_append");
             }
             ensurePlayablePosition();
@@ -460,6 +470,6 @@
     context.start(options);
     update("Checking", "Testing receiver capabilities before one endpoint probe");
   }
-  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }) });
+  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, createMediaCreditEmitter, capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }) });
   if (typeof document !== "undefined") document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", boot, { once: true }) : boot();
 })(globalThis);
