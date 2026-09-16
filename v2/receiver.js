@@ -2,7 +2,7 @@
   "use strict";
 
   const RECEIVER_VERSION = "2.0.0";
-  const RECEIVER_REVISION = "2f6ad2a";
+  const RECEIVER_REVISION = "001e6806";
   const PROTOCOL_VERSION = 2;
   const NAMESPACE = "urn:x-cast:com.ashwinbhajan.screenmirror.cmafprobe.v2";
   const MIME_TYPE = 'video/mp4; codecs="avc1.42e01f"';
@@ -98,6 +98,102 @@
     if (hasOrderedMatch) return "append_order";
     return "unavailable";
   }
+  // Diagnostic state only: no media payloads, credits, or queue ownership.
+  function createFrameCorrelationTracker(generation, diagnostic, stage, rendered) {
+    const fragments = []; const controls = new Map(); const callbacks = [];
+    const maxFragments = 64; const maxCallbacks = 256; const ttlMs = 10000;
+    const counts = {}; let closed = false;
+    const emit = (reason) => { counts[reason] = (counts[reason] || 0) + 1; if (counts[reason] <= 8) diagnostic(reason); };
+    const fail = () => emit("rendered_frame_uncorrelated_no_fragment_match");
+    const expire = (now) => {
+      while (fragments.length && (now - fragments[0].receivedAt >= ttlMs || fragments.length > maxFragments)) {
+        const item = fragments.shift();
+        if (!item.correlation) emit("frame_correlation_late_bind_expired");
+      }
+      for (const [key, item] of controls) if (now - item.at >= ttlMs) controls.delete(key);
+      while (callbacks.length && (now - callbacks[0].now >= ttlMs || callbacks.length > maxCallbacks)) { callbacks.shift(); fail(); }
+    };
+    const bind = (item, control) => {
+      item.correlation = control;
+      controls.delete(control.sequence);
+      if (item.appendedAt !== undefined) emit("frame_correlation_late_bound");
+      for (const [name, at] of [["received", item.receivedAt], ["append_started", item.startedAt], ["append_ended", item.appendedAt]]) {
+        if (at !== undefined) stage(name, control.sequence, at, item.metrics[name]);
+      }
+    };
+    const match = (frame) => {
+      const appended = fragments.filter((item) => item.appendedAt !== undefined && item.appendedAt <= frame.now);
+      // Match the actual fragment's decode-time interval before using ordered fallback.
+      const exact = appended.find((item, index) => frame.metadata.mediaTime >= item.mediaTime - 0.001 &&
+        frame.metadata.mediaTime < (appended[index + 1] ? appended[index + 1].mediaTime : item.mediaTime + 0.5));
+      let item = exact;
+      if (!item) item = appended.find((candidate) => !candidate.sent);
+      if (!item || !item.correlation) return false;
+      if (!item.sent) { item.sent = true; rendered(frame.now, frame.metadata, item.correlation); }
+      return true;
+    };
+    const retry = () => { for (let i = 0; i < callbacks.length;) { if (match(callbacks[i])) callbacks.splice(i, 1); else i += 1; } };
+    return {
+      receive(id, mediaTime, now, metrics) {
+        if (closed) return null;
+        expire(now);
+        const item = { id, mediaTime, receivedAt: now, metrics: { received: metrics } };
+        fragments.push(item); expire(now);
+        const control = Array.from(controls.values()).find((value) => Math.abs(value.mediaTime - mediaTime) <= 0.001);
+        if (control) bind(item, control);
+        return item;
+      },
+      start(item, now, metrics) { if (!item || closed) return; item.startedAt = now; item.metrics.append_started = metrics; if (item.correlation) stage("append_started", item.correlation.sequence, now, metrics); },
+      append(item, now, metrics) { if (!item || closed) return; item.appendedAt = now; item.metrics.append_ended = metrics; if (item.correlation) stage("append_ended", item.correlation.sequence, now, metrics); expire(now); retry(); },
+      control(value, now) {
+        if (closed || value.generation !== generation || value.sequence <= 0 || !Number.isFinite(value.mediaTimeMs)) return;
+        expire(now);
+        const control = { generation, sequence: value.sequence, mediaTime: value.mediaTimeMs / 1000, at: now };
+        const item = fragments.find((candidate) => !candidate.correlation && Math.abs(candidate.mediaTime - control.mediaTime) <= 0.001);
+        if (item) { bind(item, control); retry(); }
+        else { controls.set(control.sequence, control); if (controls.size > maxFragments) controls.delete(controls.keys().next().value); }
+      },
+      frame(now, metadata) { if (closed) return; expire(now); const frame = { now, metadata }; if (!match(frame)) { callbacks.push(frame); expire(now); } },
+      finish(now) { if (closed) return; expire(now); retry(); while (callbacks.length) { callbacks.shift(); fail(); } closed = true; fragments.length = 0; controls.clear(); },
+      snapshot: () => ({ fragments: fragments.length, controls: controls.size, callbacks: callbacks.length, counts: { ...counts } })
+    };
+  }
+  function createFramePacingSummary(emit) {
+    // Fixed histogram: full-session percentiles rounded up to 1 ms; >10 s is overflow.
+    const cadence = () => ({ count: 0, first: null, last: null, max: 0, bursts: 0, histogram: new Uint32Array(10002) });
+    const render = cadence(); const append = cadence();
+    let firstPresented = null; let lastPresented = null; let presentedJumps = 0; let finished = false;
+    const add = (value, now) => {
+      if (value.last !== null) { const interval = Math.max(0, now - value.last); value.max = Math.max(value.max, interval); if (interval < 8) value.bursts += 1; value.histogram[Math.min(10001, Math.ceil(interval))] += 1; }
+      if (value.first === null) value.first = now;
+      value.last = now; value.count += 1;
+    };
+    const summarize = (value) => {
+      const percentile = (fraction) => { const target = Math.ceil((value.count - 1) * fraction); if (target <= 0) return null; let count = 0; for (let i = 0; i < value.histogram.length; i += 1) { count += value.histogram[i]; if (count >= target) return i; } return null; };
+      return { count: value.count, durationMs: value.count > 1 ? Math.round(value.last - value.first) : 0, p50Ms: percentile(0.5), p95Ms: percentile(0.95), maxMs: value.count > 1 ? Math.round(value.max) : null, burstUnder8Ms: value.bursts, intervalOverflow: value.histogram[10001] };
+    };
+    return {
+      frame(now, metadata) {
+        if (finished) return;
+        add(render, now);
+        if (Number.isFinite(metadata.presentedFrames)) { if (firstPresented === null) firstPresented = metadata.presentedFrames; if (lastPresented !== null && metadata.presentedFrames - lastPresented > 1) presentedJumps += 1; lastPresented = metadata.presentedFrames; }
+      },
+      append(now) { if (!finished) add(append, now); },
+      stop(counts) {
+        if (finished) return null;
+        finished = true;
+        const r = summarize(render); const a = summarize(append);
+        const delta = firstPresented === null ? null : Math.max(0, lastPresented - firstPresented);
+        const summary = { render: r, append: a, presentedFramesDelta: delta, presentedFPSMilli: delta !== null && r.durationMs > 0 ? Math.round(delta * 1000000 / r.durationMs) : null, presentedJumps, uncorrelated: counts.rendered_frame_uncorrelated_no_fragment_match || 0, lateBound: counts.frame_correlation_late_bound || 0, lateBindExpired: counts.frame_correlation_late_bind_expired || 0 };
+        // Numeric, allowlisted category characters survive the existing iOS diagnostic exporter.
+        const fields = (object) => Object.entries(object).map(([key, value]) => `${key}_${value === null ? "na" : value}`).join("_");
+        emit(`frame_pacing_summary_render_${fields(r)}`);
+        emit(`frame_pacing_summary_append_${fields(a)}`);
+        emit(`frame_pacing_summary_presentedFramesDelta_${delta === null ? "na" : delta}_presentedFPSMilli_${summary.presentedFPSMilli === null ? "na" : summary.presentedFPSMilli}_presentedJumps_${presentedJumps}_uncorrelated_no_fragment_match_${summary.uncorrelated}_lateBound_${summary.lateBound}_lateBindExpired_${summary.lateBindExpired}`);
+        return summary;
+      }
+    };
+  }
   function send(senderId, requestId, result) {
     context.sendCustomMessage(NAMESPACE, senderId, makeResult(requestId, result));
   }
@@ -136,11 +232,14 @@
     sendMediaResult(event.senderId, request.requestId, `receiver_revision_reported_${RECEIVER_REVISION}`);
     const pending = []; const maxPending = 8;
     const flowGeneration = 1; const initialCredits = 8; let mediaReadySent = false;
-    let source; let buffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let lastAppendingSequence = 0; let firstRendered = false; let playAttempted = false; let initialSeekRequested = false; let initialSeekCompleted = false; let recoverySeekPending = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let playTimeout; let receiverStopped = false; let stallThresholdMs = 1500; let recoveryTailSeconds = 0.05; let recoveryMinimumLeadSeconds = 0.05; let recoveryTimeoutMs = 3000; let lastPlayback = { time: 0, advancedAt: performance.now(), recoveryAwaitingProgress: false, recoveryTimeout: undefined };
-    const latencyCorrelations = new Map(); const appendedCorrelations = []; let uncorrelatedRenderedFrames = 0; let latencyFallback = false;
+    let source; let buffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let lastAppendingFragment = null; let firstRendered = false; let playAttempted = false; let initialSeekRequested = false; let initialSeekCompleted = false; let recoverySeekPending = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let playTimeout; let receiverStopped = false; let stallThresholdMs = 1500; let recoveryTailSeconds = 0.05; let recoveryMinimumLeadSeconds = 0.05; let recoveryTimeoutMs = 3000; let lastPlayback = { time: 0, advancedAt: performance.now(), recoveryAwaitingProgress: false, recoveryTimeout: undefined };
+    let latencyFallback = false; let frameCallbackID;
+    // Preserve the existing timeupdate fallback on receivers without rVFC.
+    const latencyCorrelations = new Map();
     const sendLatency = (value) => { try { if (socket && socket.readyState === 1) socket.send(JSON.stringify(value)); } catch (_) {} };
-    const sendLatencyStage = (stage, sequence) => {
-      const message = makeLatencyStage(flowGeneration, sequence, stage, performance.now(), Math.round(bufferedLead(video) * 1000), Math.max(0, Math.min(maxPending, pending.length)));
+    const captureStageMetrics = () => ({ bufferLeadMs: Math.round(bufferedLead(video) * 1000), pendingDepth: Math.max(0, Math.min(maxPending, pending.length)) });
+    const sendLatencyStage = (stage, sequence, at, metrics) => {
+      const message = makeLatencyStage(flowGeneration, sequence, stage, at, metrics.bufferLeadMs, metrics.pendingDepth);
       if (message) sendLatency(message);
     };
     // Each runMedia call owns one receiver generation/session, so this counter
@@ -153,28 +252,22 @@
       sendMediaResult(event.senderId, request.requestId, `first_frame_callback_presented_${presentedFrames}`);
       context.sendCustomMessage(NAMESPACE, event.senderId, { type: "firstRenderedFrame", protocolVersion: PROTOCOL_VERSION, requestId: request.requestId, receiverVersion: RECEIVER_VERSION, appendBacklogHighWatermark });
     };
+    const pacing = createFramePacingSummary((result) => sendMediaResult(event.senderId, request.requestId, result));
+    const correlations = createFrameCorrelationTracker(flowGeneration,
+      (result) => sendMediaResult(event.senderId, request.requestId, result), sendLatencyStage,
+      (now, metadata, correlation) => sendLatency({ type: "renderedFrame", generation: correlation.generation, sequence: correlation.sequence, receiverTimeMs: now, mediaTimeMs: Math.round(metadata.mediaTime * 1000), presentedFrames: Number.isFinite(metadata.presentedFrames) ? metadata.presentedFrames : 0, bufferLeadMs: metadata.bufferLeadMs }));
     const observeFrame = (now, metadata) => {
+      if (receiverStopped) return;
       confirmFirstRendered(metadata);
-      let nearest = null;
-      for (const item of latencyCorrelations.values()) { const distance = Math.abs(item.mediaTime - metadata.mediaTime); if (distance <= 0.5 && (!nearest || distance < nearest.distance)) nearest = { ...item, distance }; }
-      let strategy = renderedCorrelationStrategy(!!nearest, appendedCorrelations.length > 0);
-      if (!nearest && appendedCorrelations.length) nearest = appendedCorrelations.shift();
-      if (!nearest) {
-        if (uncorrelatedRenderedFrames < 8) {
-          uncorrelatedRenderedFrames += 1;
-          sendMediaResult(event.senderId, request.requestId, "rendered_frame_uncorrelated_no_fragment_match");
-        }
-        return;
-      }
-      latencyCorrelations.delete(nearest.sequence);
-      const appendedIndex = appendedCorrelations.findIndex((item) => item.sequence === nearest.sequence);
-      if (appendedIndex >= 0) appendedCorrelations.splice(appendedIndex, 1);
-      if (strategy === "append_order") sendMediaResult(event.senderId, request.requestId, "rendered_frame_correlated_append_order");
-      sendLatency({ type: "renderedFrame", generation: nearest.generation, sequence: nearest.sequence, receiverTimeMs: now, mediaTimeMs: Math.round(metadata.mediaTime * 1000), presentedFrames: Number.isFinite(metadata.presentedFrames) ? metadata.presentedFrames : 0, bufferLeadMs: Math.round(bufferedLead(video) * 1000) });
+      pacing.frame(now, metadata);
+      correlations.frame(now, { ...metadata, bufferLeadMs: Math.round(bufferedLead(video) * 1000) });
     };
     const installFrameObserver = () => {
-      if (typeof video.requestVideoFrameCallback === "function") { sendLatency({ type: "latencyCapability", mode: "requestVideoFrameCallback" }); const next = (now, metadata) => { observeFrame(now, metadata); video.requestVideoFrameCallback(next); }; video.requestVideoFrameCallback(next); }
-      else { latencyFallback = true; sendLatency({ type: "latencyCapability", mode: "playbackAckFallback" }); }
+      if (typeof video.requestVideoFrameCallback === "function") {
+        sendLatency({ type: "latencyCapability", mode: "requestVideoFrameCallback" });
+        const next = (now, metadata) => { if (receiverStopped) return; observeFrame(now, metadata); frameCallbackID = video.requestVideoFrameCallback(next); };
+        frameCallbackID = video.requestVideoFrameCallback(next);
+      } else { latencyFallback = true; sendLatency({ type: "latencyCapability", mode: "playbackAckFallback" }); }
     };
     const clearInitAppendTimeout = () => { if (initAppendTimeout) { global.clearTimeout(initAppendTimeout); initAppendTimeout = undefined; } };
     const clearPlayTimeout = () => { if (playTimeout) { global.clearTimeout(playTimeout); playTimeout = undefined; } };
@@ -182,6 +275,9 @@
     const clearVideoForReceiverStop = () => {
       if (receiverStopped) return;
       receiverStopped = true;
+      correlations.finish(performance.now());
+      pacing.stop(correlations.snapshot().counts);
+      if (frameCallbackID !== undefined && typeof video.cancelVideoFrameCallback === "function") video.cancelVideoFrameCallback(frameCallbackID);
       clearRecoveryTimeout();
       pending.length = 0;
       try { video.pause(); video.removeAttribute("src"); video.load(); } catch (_) {}
@@ -298,7 +394,7 @@
     };
     const appendNext = () => {
       if (!buffer || buffer.updating || !pending.length) return;
-      const item = pending.shift(); lastAppendingType = item.type; lastAppendingSequence = item.correlationSequence || 0;
+      const item = pending.shift(); lastAppendingType = item.type; lastAppendingFragment = item.fragment || null;
       if (item.type === 1) {
         initAppendPending = true;
         sendMediaResult(event.senderId, request.requestId, `init_append_started_len_${item.payload.byteLength}`);
@@ -308,7 +404,7 @@
       }
       if (item.type === 2) {
         mediaAppendPending = true;
-        sendLatencyStage("append_started", lastAppendingSequence);
+        correlations.start(lastAppendingFragment, performance.now(), captureStageMetrics());
         sendMediaResult(event.senderId, request.requestId, `media_append_started_len_${item.payload.byteLength}`);
       }
       try { buffer.appendBuffer(item.payload); } catch (_) {
@@ -338,13 +434,9 @@
             if (lastAppendingType === 2 && mediaAppendPending) {
               mediaAppendPending = false;
               appendedFragments += 1;
-              sendLatencyStage("append_ended", lastAppendingSequence);
+              correlations.append(lastAppendingFragment, performance.now(), captureStageMetrics());
+              pacing.append(performance.now());
               sendMediaResult(event.senderId, request.requestId, "media_append_updateend");
-              const appendedCorrelation = latencyCorrelations.get(lastAppendingSequence);
-              if (appendedCorrelation) {
-                appendedCorrelations.push(appendedCorrelation);
-                if (appendedCorrelations.length > 64) appendedCorrelations.shift();
-              }
               if (mediaReadySent) emitMediaCredit();
               playbackTelemetry("first_media_append");
             }
@@ -378,25 +470,28 @@
               const control = parse(message.data); if (!control) { stop("protocol_error"); return; }
               if (control.type === "readyForMedia") return;
               if (control.type === "clockPing" && Number.isFinite(control.t1) && Number.isInteger(control.sequence)) { const t2 = performance.now(); sendLatency({ type: "clockPong", sequence: control.sequence, t1: control.t1, t2, t3: performance.now() }); return; }
-              if (control.type === "frameCorrelation" && Number.isInteger(control.generation) && Number.isInteger(control.sequence) && Number.isFinite(control.mediaTimeMs)) { if (latencyCorrelations.size >= 256) latencyCorrelations.delete(latencyCorrelations.keys().next().value); latencyCorrelations.set(control.sequence, { generation: control.generation, sequence: control.sequence, mediaTime: control.mediaTimeMs / 1000 }); return; }
+              if (control.type === "frameCorrelation" && Number.isInteger(control.generation) && Number.isInteger(control.sequence) && Number.isFinite(control.mediaTimeMs)) { correlations.control(control, performance.now());
+                if (latencyFallback) {
+                  if (latencyCorrelations.size >= 256) latencyCorrelations.delete(latencyCorrelations.keys().next().value);
+                  latencyCorrelations.set(control.sequence, { generation: control.generation, sequence: control.sequence, mediaTime: control.mediaTimeMs / 1000 });
+                }
+                return;
+              }
               stop("protocol_error"); return;
             }
             const envelope = parseEnvelope(message.data); if (!envelope) { stop("binary_envelope_invalid"); return; }
             if (envelope.type === 1) { enqueue(envelope); return; }
             if (envelope.type === 2) {
               const summary = summarizeFragment(envelope.payload);
-              let correlationSequence = 0;
+              let fragment = null;
               if (summary) {
-                for (const item of latencyCorrelations.values()) {
-                  if (Math.abs(item.mediaTime - summary.decodeTime / 90000) <= 0.001) { correlationSequence = item.sequence; break; }
-                }
-                sendLatencyStage("received", correlationSequence);
+                fragment = correlations.receive(envelope.sequence, summary.decodeTime / 90000, performance.now(), captureStageMetrics());
                 sendMediaResult(event.senderId, request.requestId, `media_fragment_received_len_${envelope.payload.byteLength}`);
                 sendMediaResult(event.senderId, request.requestId, `first_fragment_seq_${summary.sequence}_samples_${summary.sampleCount}_tfdt_${summary.decodeTime}_offset_${summary.dataOffset}_payload_${summary.payloadLength}_nal_${summary.firstNALType}`);
               } else {
                 sendMediaResult(event.senderId, request.requestId, "media_fragment_layout_invalid");
               }
-              firstKeyframe = true; enqueue({ ...envelope, correlationSequence }); return;
+              firstKeyframe = true; enqueue({ ...envelope, fragment }); return;
             }
             stop("binary_envelope_invalid");
           };
@@ -583,6 +678,6 @@
     context.start(options);
     update("Checking", "Testing receiver capabilities before one endpoint probe");
   }
-  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, makeLatencyStage, canConfirmFirstRendered, renderedCorrelationStrategy, createMediaCreditEmitter, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }) });
+  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, makeLatencyStage, canConfirmFirstRendered, renderedCorrelationStrategy, createMediaCreditEmitter, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }) });
   if (typeof document !== "undefined") document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", boot, { once: true }) : boot();
 })(globalThis);

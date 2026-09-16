@@ -61,7 +61,7 @@ test("does not change credit emission while adding playback recovery helpers", (
 
 test("declares bounded receiver-stop cleanup diagnostics", () => {
   const gate = receiver();
-  assert.equal(gate.receiverRevision, "2f6ad2a");
+  assert.equal(gate.receiverRevision, "001e6806");
   assert.deepEqual(JSON.parse(JSON.stringify(gate.receiverStopDiagnostics)), ["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown"]);
 });
 
@@ -131,4 +131,186 @@ test("resets media-credit sequence for a new receiver generation/session", () =>
 
   assert.equal(firstGeneration[0].creditSequence, 1);
   assert.equal(nextGeneration[0].creditSequence, 1);
+});
+
+function correlationHarness() {
+  const diagnostics = []; const stages = []; const frames = [];
+  const tracker = receiver().createFrameCorrelationTracker(1, (value) => diagnostics.push(value),
+    (...value) => stages.push(value.slice(0, 3)), (...value) => frames.push(value));
+  return { tracker, diagnostics, stages, frames };
+}
+
+test("late control binds appended fragment and replays original stages and pending render", () => {
+  const { tracker, diagnostics, stages, frames } = correlationHarness();
+  const fragment = tracker.receive(71, 12, 100);
+  tracker.start(fragment, 110); tracker.append(fragment, 120);
+  tracker.frame(130, { mediaTime: 12.02, presentedFrames: 1 });
+  assert.equal(diagnostics.length, 0, "do not diagnose before late binding is exhausted");
+  tracker.control({ generation: 1, sequence: 9, mediaTimeMs: 12000 }, 140);
+  assert.deepEqual(diagnostics, ["frame_correlation_late_bound"]);
+  assert.deepEqual(stages, [["received", 9, 100], ["append_started", 9, 110], ["append_ended", 9, 120]]);
+  assert.equal(frames[0][0], 130);
+  assert.equal(frames[0][2].sequence, 9, "envelope and latency sequence are independent");
+  tracker.frame(150, { mediaTime: 12.04, presentedFrames: 2 });
+  tracker.finish(160);
+  assert.equal(frames.length, 1, "one latency sample per fragment without false uncorrelated callbacks");
+  assert.equal(tracker.snapshot().counts.rendered_frame_uncorrelated_no_fragment_match, undefined);
+});
+
+test("late binding provides append-order fallback for subsequent rendered callback", () => {
+  const { tracker, frames } = correlationHarness();
+  const fragment = tracker.receive(1, 100, 0);
+  tracker.start(fragment, 1); tracker.append(fragment, 2);
+  tracker.control({ generation: 1, sequence: 25, mediaTimeMs: 100000 }, 3);
+  tracker.frame(4, { mediaTime: 0, presentedFrames: 1 });
+  assert.equal(frames.length, 1);
+  assert.equal(frames[0][2].sequence, 25);
+});
+
+test("control before append and during append both retain correlation", () => {
+  for (const early of [true, false]) {
+    const { tracker, frames, diagnostics, stages } = correlationHarness();
+    const control = { generation: 1, sequence: 3, mediaTimeMs: 5000 };
+    if (early) tracker.control(control, 0);
+    const fragment = tracker.receive(8, 5, 1); tracker.start(fragment, 2);
+    if (!early) tracker.control(control, 3);
+    tracker.append(fragment, 4); tracker.frame(5, { mediaTime: 5.1, presentedFrames: 1 });
+    assert.equal(frames.length, 1); assert.equal(stages.length, 3); assert.equal(diagnostics.length, 0);
+  }
+});
+
+test("fragment, orphan-control, callback retention and diagnostics remain bounded", () => {
+  const { tracker, diagnostics } = correlationHarness();
+  for (let i = 0; i < 1000; i += 1) {
+    tracker.receive(i, i, i);
+    tracker.control({ generation: 1, sequence: i + 1, mediaTimeMs: (i + 10000) * 1000 }, i);
+    tracker.frame(i, { mediaTime: -1, presentedFrames: i });
+  }
+  assert.equal(tracker.snapshot().fragments, 64);
+  assert.equal(tracker.snapshot().controls, 64);
+  assert.equal(tracker.snapshot().callbacks, 256);
+  assert.equal(diagnostics.filter((value) => value === "frame_correlation_late_bind_expired").length, 8);
+  tracker.finish(20000);
+  assert.equal(tracker.snapshot().fragments, 0);
+  assert.equal(tracker.snapshot().controls, 0);
+  assert.equal(tracker.snapshot().callbacks, 0);
+  assert.equal(tracker.snapshot().counts.rendered_frame_uncorrelated_no_fragment_match, 1000);
+  assert.equal(diagnostics.filter((value) => value.startsWith("rendered_frame_uncorrelated")).length, 8);
+});
+
+test("expired fragments and wrong generations cannot bind", () => {
+  const { tracker, frames, diagnostics } = correlationHarness();
+  const fragment = tracker.receive(1, 1, 0); tracker.start(fragment, 1); tracker.append(fragment, 2);
+  tracker.control({ generation: 2, sequence: 1, mediaTimeMs: 1000 }, 3);
+  tracker.frame(4, { mediaTime: 1, presentedFrames: 1 });
+  tracker.control({ generation: 1, sequence: 1, mediaTimeMs: 1000 }, 10000);
+  tracker.finish(10005);
+  assert.equal(frames.length, 0);
+  assert.ok(diagnostics.includes("frame_correlation_late_bind_expired"));
+  assert.equal(tracker.snapshot().counts.rendered_frame_uncorrelated_no_fragment_match, 1);
+});
+
+test("stop emits exactly one bounded full-session frame-pacing summary", () => {
+  const messages = []; const pacing = receiver().createFramePacingSummary((value) => messages.push(value));
+  [0, 5, 25, 65].forEach((time, i) => pacing.frame(time, { presentedFrames: [10, 11, 14, 15][i] }));
+  [0, 30, 60].forEach((time) => pacing.append(time));
+  const summary = pacing.stop({ rendered_frame_uncorrelated_no_fragment_match: 19, frame_correlation_late_bound: 5 });
+  assert.equal(summary.render.count, 4);
+  assert.equal(summary.render.p50Ms, 20); assert.equal(summary.render.p95Ms, 40); assert.equal(summary.render.maxMs, 40);
+  assert.equal(summary.render.burstUnder8Ms, 1); assert.equal(summary.presentedJumps, 1);
+  assert.equal(summary.presentedFramesDelta, 5); assert.equal(summary.presentedFPSMilli, 76923);
+  assert.equal(summary.append.p50Ms, 30); assert.equal(summary.uncorrelated, 19);
+  assert.equal(pacing.stop({}), null);
+  pacing.frame(100, { presentedFrames: 16 });
+  assert.equal(messages.length, 3);
+  for (const message of messages) { assert.match(message, /^[a-zA-Z0-9_]+$/); assert.ok(message.length < 700); }
+});
+
+test("empty pacing and missing presentedFrames stay unavailable, not invented", () => {
+  const pacing = receiver().createFramePacingSummary(() => {});
+  const summary = pacing.stop({});
+  assert.equal(summary.render.count, 0); assert.equal(summary.render.p95Ms, null);
+  assert.equal(summary.presentedFPSMilli, null); assert.equal(summary.presentedFramesDelta, null);
+});
+
+test("pacing histogram covers long sessions with explicit overflow", () => {
+  const pacing = receiver().createFramePacingSummary(() => {});
+  for (let i = 0; i < 100000; i += 1) pacing.frame(i * 20, { presentedFrames: i });
+  pacing.frame(2010000, { presentedFrames: 100000 });
+  const summary = pacing.stop({});
+  assert.equal(summary.render.count, 100001); assert.equal(summary.render.p95Ms, 20);
+  assert.equal(summary.render.intervalOverflow, 1); assert.equal(summary.render.maxMs, 10020);
+});
+
+test("normal socket stop exports pacing through same-request CAF messages and cancels callbacks", async () => {
+  const messages = []; const sources = []; const sockets = []; const wire = []; const buffers = []; let receiverListener; let nextFrame; let cancelled = false;
+  const video = { buffered: { length: 0 }, currentTime: 0, playbackRate: 1, pause() {}, load() {}, removeAttribute() {},
+    addEventListener() {}, requestVideoFrameCallback(callback) { nextFrame = callback; return 42; },
+    cancelVideoFrameCallback(id) { cancelled = id === 42; } };
+  class MediaSource {
+    static isTypeSupported() { return true; }
+    constructor() { this.listeners = {}; sources.push(this); }
+    addEventListener(name, callback) { this.listeners[name] = callback; }
+    addSourceBuffer() { const buffer = { listeners: {}, addEventListener(name, callback) { this.listeners[name] = callback; }, appendBuffer() {} }; buffers.push(buffer); return buffer; }
+  }
+  class WebSocket { constructor() { this.readyState = 1; sockets.push(this); } send(value) { wire.push(JSON.parse(value)); } close() {} }
+  const context = { ArrayBuffer, Uint8Array, DataView, TextEncoder, URL: { createObjectURL: () => "blob:test" }, performance: { now: () => 0 }, setTimeout: () => 1, clearTimeout() {}, MediaSource, WebSocket,
+    document: { readyState: "complete", getElementById: (id) => id === "probe-video" ? video : {}, body: { classList: { add() {}, remove() {} } } },
+    cast: { framework: { CastReceiverContext: { getInstance: () => ({ addCustomMessageListener: (_, callback) => { receiverListener = callback; }, start() {}, sendCustomMessage: (_, sender, message) => messages.push({ sender, ...message }) }) }, CastReceiverOptions: function () {}, system: { MessageType: { JSON: "JSON" } } } } };
+  // URL must remain constructible for endpoint validation.
+  context.URL = class extends URL { static createObjectURL() { return "blob:test"; } };
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, "..", "receiver.js"), "utf8"), context);
+  sources[0].listeners.sourceopen(); await new Promise(setImmediate);
+  receiverListener({ senderId: "sender", data: { type: "startMedia", protocolVersion: 2, requestId: "session_request", endpoint: "ws://192.168.1.1:1234/" + "a".repeat(64) } });
+  await new Promise(setImmediate); sources[1].listeners.sourceopen(); sockets[0].onopen();
+  // A minimal valid moof/traf/mdat fixture, envelope sequence distinct from control sequence.
+  const box = (name, payload) => { const result = Buffer.alloc(8 + payload.length); result.writeUInt32BE(result.length); result.write(name, 4); payload.copy(result, 8); return result; };
+  const mfhd = Buffer.alloc(8); mfhd.writeUInt32BE(71, 4);
+  const tfdt = Buffer.alloc(8);
+  const trun = Buffer.alloc(12); trun.writeUInt32BE(1, 4); trun.writeUInt32BE(76, 8);
+  const moof = box("moof", Buffer.concat([box("mfhd", mfhd), box("traf", Buffer.concat([box("tfdt", tfdt), box("trun", trun)]))]));
+  const payload = Buffer.concat([moof, box("mdat", Buffer.from([0, 0, 0, 1, 0x65]))]);
+  const header = Buffer.alloc(14); header.write("SMC1"); header[4] = 2; header[5] = 2; header.writeUInt32BE(71, 6); header.writeUInt32BE(payload.length, 10);
+  const binary = Uint8Array.from(Buffer.concat([header, payload])).buffer;
+  sockets[0].onmessage({ data: binary }); buffers[1].listeners.updateend();
+  nextFrame(10, { mediaTime: 0, presentedFrames: 1 });
+  sockets[0].onmessage({ data: JSON.stringify({ type: "frameCorrelation", generation: 1, sequence: 9, mediaTimeMs: 0 }) }); nextFrame(30, { mediaTime: 0.02, presentedFrames: 2 });
+  sockets[0].onclose(); sockets[0].onclose();
+  const summary = messages.filter((value) => value.result && value.result.startsWith("frame_pacing_summary_"));
+  assert.equal(summary.length, 3); assert.ok(cancelled);
+  assert.deepEqual(wire.filter((value) => value.type === "latencyStage").map((value) => value.stage), ["received", "append_started", "append_ended"]);
+  const rendered = wire.filter((value) => value.type === "renderedFrame");
+  assert.equal(rendered.length, 1); assert.equal(rendered[0].sequence, 9); assert.equal(rendered[0].receiverTimeMs, 10);
+  assert.ok(messages.some((value) => value.result === "frame_correlation_late_bound"));
+  assert.ok(summary[0].result.includes("count_2"));
+  assert.ok(summary[2].result.includes("uncorrelated_no_fragment_match_0"));
+  for (const message of summary) { assert.equal(message.requestId, "session_request"); assert.equal(message.sender, "sender"); assert.ok(JSON.stringify(message).length < 1024); }
+  assert.ok(messages.findIndex((value) => value.result === "receiver_video_cleared") > messages.indexOf(summary[2]));
+  nextFrame(50, { mediaTime: 0.04, presentedFrames: 3 });
+  assert.equal(messages.filter((value) => value.result && value.result.startsWith("frame_pacing_summary_")).length, 3);
+});
+
+test("late-bound stage replay preserves original buffer lead and queue snapshots", () => {
+  const stages = [];
+  const tracker = receiver().createFrameCorrelationTracker(1, () => {}, (...values) => stages.push(values), () => {});
+  const fragment = tracker.receive(1, 5, 10, { bufferLeadMs: 20, pendingDepth: 2 });
+  tracker.start(fragment, 20, { bufferLeadMs: 15, pendingDepth: 1 });
+  tracker.append(fragment, 30, { bufferLeadMs: 150, pendingDepth: 0 });
+  tracker.control({ generation: 1, sequence: 7, mediaTimeMs: 5000 }, 100);
+  assert.deepEqual(stages, [
+    ["received", 7, 10, { bufferLeadMs: 20, pendingDepth: 2 }],
+    ["append_started", 7, 20, { bufferLeadMs: 15, pendingDepth: 1 }],
+    ["append_ended", 7, 30, { bufferLeadMs: 150, pendingDepth: 0 }]
+  ]);
+});
+
+test("ordered fallback waits for older unresolved append instead of consuming a newer correlation", () => {
+  const { tracker, frames } = correlationHarness();
+  const first = tracker.receive(1, 100, 0); tracker.start(first, 1); tracker.append(first, 2);
+  const second = tracker.receive(2, 101, 3); tracker.start(second, 4); tracker.append(second, 5);
+  tracker.control({ generation: 1, sequence: 20, mediaTimeMs: 101000 }, 6);
+  tracker.frame(7, { mediaTime: 0, presentedFrames: 1 });
+  assert.equal(frames.length, 0);
+  tracker.control({ generation: 1, sequence: 10, mediaTimeMs: 100000 }, 8);
+  assert.equal(frames.length, 1); assert.equal(frames[0][2].sequence, 10);
 });
