@@ -64,6 +64,11 @@
     if (!Number.isFinite(currentTime) || !Number.isFinite(start) || !Number.isFinite(end) || end <= start || currentTime >= start) return null;
     return start + Math.min(0.05, Math.max(0, (end - start) / 2));
   }
+  function stalledLiveEdgeSeekTarget(currentTime, start, end) {
+    if (!Number.isFinite(currentTime) || !Number.isFinite(start) || !Number.isFinite(end) || end <= start || end - currentTime < 0.05) return null;
+    const target = Math.max(start + 0.05, end - 0.05);
+    return target > currentTime + 0.02 ? target : null;
+  }
   function bufferedTrimEnd(currentTime, start, end) {
     if (!Number.isFinite(currentTime) || !Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
     if (currentTime - start <= TRIM_HISTORY_THRESHOLD_SECONDS || end - currentTime < 0.5) return null;
@@ -120,7 +125,7 @@
     update("Media", "Waiting for the first decodable video frame");
     const pending = []; const maxPending = 8;
     const flowGeneration = 1; const initialCredits = 8; let mediaReadySent = false;
-    let source; let buffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let lastAppendingSequence = 0; let firstRendered = false; let playAttempted = false; let initialSeekRequested = false; let initialSeekCompleted = false; let recoverySeekPending = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let playTimeout;
+    let source; let buffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let lastAppendingSequence = 0; let firstRendered = false; let playAttempted = false; let initialSeekRequested = false; let initialSeekCompleted = false; let recoverySeekPending = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let playTimeout; let stallThresholdMs = 1500; let recoveryTailSeconds = 0.05; let recoveryMinimumLeadSeconds = 0.05; let recoveryTimeoutMs = 3000; let lastPlayback = { time: 0, advancedAt: performance.now(), recoveryAwaitingProgress: false, recoveryTimeout: undefined };
     const latencyCorrelations = new Map(); let latencyFallback = false;
     const sendLatency = (value) => { try { if (socket && socket.readyState === 1) socket.send(JSON.stringify(value)); } catch (_) {} };
     const sendLatencyStage = (stage, sequence) => {
@@ -150,6 +155,7 @@
     };
     const clearInitAppendTimeout = () => { if (initAppendTimeout) { global.clearTimeout(initAppendTimeout); initAppendTimeout = undefined; } };
     const clearPlayTimeout = () => { if (playTimeout) { global.clearTimeout(playTimeout); playTimeout = undefined; } };
+    const clearRecoveryTimeout = () => { if (lastPlayback.recoveryTimeout) { global.clearTimeout(lastPlayback.recoveryTimeout); lastPlayback.recoveryTimeout = undefined; } };
     const stop = (result) => { clearInitAppendTimeout(); clearPlayTimeout(); try { socket && socket.close(); } catch (_) {} sendMediaResult(event.senderId, request.requestId, result); };
     const safePlayRejection = (error) => {
       if (error && error.name === "NotAllowedError") return "play_rejected_not_allowed";
@@ -220,8 +226,34 @@
       const target = recoverySeekTarget(video.currentTime, video.buffered.start(0), video.buffered.end(0));
       if (target === null) return;
       recoverySeekPending = true;
-      sendMediaResult(event.senderId, request.requestId, "recovery_seek_requested");
+      sendMediaResult(event.senderId, request.requestId, "receiver_live_edge_recovery_seek");
       try { video.currentTime = target; } catch (_) { recoverySeekPending = false; sendMediaResult(event.senderId, request.requestId, "recovery_seek_failed"); }
+    };
+    const detectPlaybackStall = () => {
+      if (!initialSeekCompleted || recoverySeekPending || !firstRendered || video.paused || video.ended || !video.buffered || !video.buffered.length) return;
+      const start = video.buffered.start(0); const end = video.buffered.end(video.buffered.length - 1);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end - video.currentTime < recoveryMinimumLeadSeconds) return;
+      if (performance.now() - lastPlayback.advancedAt < stallThresholdMs) return;
+      const target = stalledLiveEdgeSeekTarget(video.currentTime, start, end);
+      if (target === null || target - video.currentTime < 0.02) return;
+      playbackTelemetry("receiver_playback_stall_detected");
+      sendMediaResult(event.senderId, request.requestId, "receiver_playback_stall_detected");
+      recoverySeekPending = true;
+      lastPlayback.recoveryAwaitingProgress = true;
+      sendMediaResult(event.senderId, request.requestId, "receiver_live_edge_recovery_seek");
+      try {
+        video.currentTime = target;
+        clearRecoveryTimeout();
+        lastPlayback.recoveryTimeout = global.setTimeout(() => {
+          if (!lastPlayback.recoveryAwaitingProgress) return;
+          lastPlayback.recoveryAwaitingProgress = false;
+          sendMediaResult(event.senderId, request.requestId, "receiver_playback_recovery_failed");
+          playbackTelemetry("receiver_playback_recovery_failed");
+        }, recoveryTimeoutMs);
+      } catch (_) {
+        recoverySeekPending = false; lastPlayback.recoveryAwaitingProgress = false;
+        sendMediaResult(event.senderId, request.requestId, "receiver_playback_recovery_failed");
+      }
     };
     const regulateLiveEdge = () => {
       const nextRate = liveEdgePlaybackRate(bufferedLead(video), video.playbackRate);
@@ -279,6 +311,7 @@
             ensurePlayablePosition();
             attemptPlay();
             recoverPlaybackPosition();
+            detectPlaybackStall();
             regulateLiveEdge();
             // Preserve a full GOP behind the playhead. Trimming at 0.1 seconds
             // can evict the current decode dependency and force a recovery seek.
@@ -359,6 +392,16 @@
       });
       video.addEventListener("timeupdate", () => {
         if (!timeUpdated) { timeUpdated = true; sendMediaResult(event.senderId, request.requestId, "media_event_timeupdate"); }
+        if (video.currentTime > lastPlayback.time + 0.01) {
+          lastPlayback.time = video.currentTime;
+          lastPlayback.advancedAt = performance.now();
+          if (lastPlayback.recoveryAwaitingProgress) {
+            lastPlayback.recoveryAwaitingProgress = false;
+            clearRecoveryTimeout();
+            sendMediaResult(event.senderId, request.requestId, "receiver_playback_recovered");
+            playbackTelemetry("receiver_playback_recovered");
+          }
+        }
         if (latencyFallback && latencyCorrelations.size) { const mediaTime = video.currentTime; const nearest = Array.from(latencyCorrelations.values()).sort((a, b) => Math.abs(a.mediaTime - mediaTime) - Math.abs(b.mediaTime - mediaTime))[0]; if (nearest && Math.abs(nearest.mediaTime - mediaTime) <= 0.05) { latencyCorrelations.delete(nearest.sequence); sendLatency({ type: "renderedFrame", generation: nearest.generation, sequence: nearest.sequence, receiverTimeMs: performance.now(), mediaTimeMs: Math.round(mediaTime * 1000), presentedFrames: 0, bufferLeadMs: Math.round(bufferedLead(video) * 1000), fallback: true }); } }
       });
     } catch (_) { stop("media_source_failed"); }
@@ -496,6 +539,6 @@
     context.start(options);
     update("Checking", "Testing receiver capabilities before one endpoint probe");
   }
-  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, makeLatencyStage, canConfirmFirstRendered, createMediaCreditEmitter, capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }) });
+  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, makeLatencyStage, canConfirmFirstRendered, createMediaCreditEmitter, capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }) });
   if (typeof document !== "undefined") document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", boot, { once: true }) : boot();
 })(globalThis);
