@@ -2,6 +2,7 @@
   "use strict";
 
   const RECEIVER_VERSION = "2.0.0";
+  const RECEIVER_REVISION = "379ff45";
   const PROTOCOL_VERSION = 2;
   const NAMESPACE = "urn:x-cast:com.ashwinbhajan.screenmirror.cmafprobe.v2";
   const MIME_TYPE = 'video/mp4; codecs="avc1.42e01f"';
@@ -125,7 +126,9 @@
     if (!capabilityResult()) { sendMediaResult(event.senderId, request.requestId, "unsupported"); return; }
     const video = document.getElementById("probe-video");
     document.body.classList.add("media-active");
+    document.body.classList.remove("receiver-idle");
     update("Media", "Waiting for the first decodable video frame");
+    sendMediaResult(event.senderId, request.requestId, `receiver_revision_reported_${RECEIVER_REVISION}`);
     const pending = []; const maxPending = 8;
     const flowGeneration = 1; const initialCredits = 8; let mediaReadySent = false;
     let source; let buffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let lastAppendingSequence = 0; let firstRendered = false; let playAttempted = false; let initialSeekRequested = false; let initialSeekCompleted = false; let recoverySeekPending = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let playTimeout; let receiverStopped = false; let stallThresholdMs = 1500; let recoveryTailSeconds = 0.05; let recoveryMinimumLeadSeconds = 0.05; let recoveryTimeoutMs = 3000; let lastPlayback = { time: 0, advancedAt: performance.now(), recoveryAwaitingProgress: false, recoveryTimeout: undefined };
@@ -148,7 +151,7 @@
     const observeFrame = (now, metadata) => {
       confirmFirstRendered(metadata);
       let nearest = null;
-      for (const item of latencyCorrelations.values()) { const distance = Math.abs(item.mediaTime - metadata.mediaTime); if (distance <= 0.05 && (!nearest || distance < nearest.distance)) nearest = { ...item, distance }; }
+      for (const item of latencyCorrelations.values()) { const distance = Math.abs(item.mediaTime - metadata.mediaTime); if (distance <= 0.5 && (!nearest || distance < nearest.distance)) nearest = { ...item, distance }; }
       if (!nearest) return; latencyCorrelations.delete(nearest.sequence);
       sendLatency({ type: "renderedFrame", generation: nearest.generation, sequence: nearest.sequence, receiverTimeMs: now, mediaTimeMs: Math.round(metadata.mediaTime * 1000), presentedFrames: Number.isFinite(metadata.presentedFrames) ? metadata.presentedFrames : 0, bufferLeadMs: Math.round(bufferedLead(video) * 1000) });
     };
@@ -166,8 +169,10 @@
       pending.length = 0;
       try { video.pause(); video.removeAttribute("src"); video.load(); } catch (_) {}
       document.body.classList.remove("media-active");
+      document.body.classList.add("receiver-idle");
       update("Stopped", "Screen broadcast ended");
       sendMediaResult(event.senderId, request.requestId, "receiver_video_cleared");
+      sendMediaResult(event.senderId, request.requestId, "receiver_idle_screen_shown");
     };
     const stop = (result) => { clearInitAppendTimeout(); clearPlayTimeout(); try { socket && socket.close(); } catch (_) {} sendMediaResult(event.senderId, request.requestId, result); };
     const safePlayRejection = (error) => {
@@ -556,6 +561,6 @@
     context.start(options);
     update("Checking", "Testing receiver capabilities before one endpoint probe");
   }
-  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, makeLatencyStage, canConfirmFirstRendered, createMediaCreditEmitter, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }) });
+  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, makeLatencyStage, canConfirmFirstRendered, createMediaCreditEmitter, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }) });
   if (typeof document !== "undefined") document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", boot, { once: true }) : boot();
 })(globalThis);

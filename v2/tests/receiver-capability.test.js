@@ -60,7 +60,9 @@ test("does not change credit emission while adding playback recovery helpers", (
 });
 
 test("declares bounded receiver-stop cleanup diagnostics", () => {
-  assert.deepEqual(JSON.parse(JSON.stringify(receiver().receiverStopDiagnostics)), ["receiver_stop_received", "receiver_video_cleared"]);
+  const gate = receiver();
+  assert.equal(gate.receiverRevision, "379ff45");
+  assert.deepEqual(JSON.parse(JSON.stringify(gate.receiverStopDiagnostics)), ["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown"]);
 });
 
 test("retains a bounded GOP history before trimming buffered media", () => {
