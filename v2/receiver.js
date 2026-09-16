@@ -61,8 +61,11 @@
     return capabilities.webSocketAPI && capabilities.mediaSource && capabilities.avcMIME && capabilities.sourceBuffer;
   }
   function recoverySeekTarget(currentTime, start, end) {
-    if (!Number.isFinite(currentTime) || !Number.isFinite(start) || !Number.isFinite(end) || end <= start || currentTime >= start) return null;
-    return start + Math.min(0.05, Math.max(0, (end - start) / 2));
+    if (!Number.isFinite(currentTime) || !Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
+    const inset = Math.min(0.05, Math.max(0, (end - start) / 2));
+    if (currentTime < start) return start + inset;
+    if (currentTime > end) return end - inset;
+    return null;
   }
   function stalledLiveEdgeSeekTarget(currentTime, start, end) {
     if (!Number.isFinite(currentTime) || !Number.isFinite(start) || !Number.isFinite(end) || end <= start || end - currentTime < 0.05) return null;

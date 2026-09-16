@@ -41,6 +41,7 @@ test("seeks only when playback has fallen behind the live buffered range", () =>
   const gate = receiver();
   assert.equal(gate.recoverySeekTarget(29.864, 31.035, 32.069), 31.085);
   assert.equal(gate.recoverySeekTarget(31.2, 31.035, 32.069), null);
+  assert.equal(gate.recoverySeekTarget(79.18, 26.585, 29.751), 29.701);
   assert.equal(gate.recoverySeekTarget(29.864, 31.035, 31.035), null);
 });
 
