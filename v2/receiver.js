@@ -128,7 +128,7 @@
     update("Media", "Waiting for the first decodable video frame");
     const pending = []; const maxPending = 8;
     const flowGeneration = 1; const initialCredits = 8; let mediaReadySent = false;
-    let source; let buffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let lastAppendingSequence = 0; let firstRendered = false; let playAttempted = false; let initialSeekRequested = false; let initialSeekCompleted = false; let recoverySeekPending = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let playTimeout; let stallThresholdMs = 1500; let recoveryTailSeconds = 0.05; let recoveryMinimumLeadSeconds = 0.05; let recoveryTimeoutMs = 3000; let lastPlayback = { time: 0, advancedAt: performance.now(), recoveryAwaitingProgress: false, recoveryTimeout: undefined };
+    let source; let buffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let lastAppendingSequence = 0; let firstRendered = false; let playAttempted = false; let initialSeekRequested = false; let initialSeekCompleted = false; let recoverySeekPending = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let playTimeout; let receiverStopped = false; let stallThresholdMs = 1500; let recoveryTailSeconds = 0.05; let recoveryMinimumLeadSeconds = 0.05; let recoveryTimeoutMs = 3000; let lastPlayback = { time: 0, advancedAt: performance.now(), recoveryAwaitingProgress: false, recoveryTimeout: undefined };
     const latencyCorrelations = new Map(); let latencyFallback = false;
     const sendLatency = (value) => { try { if (socket && socket.readyState === 1) socket.send(JSON.stringify(value)); } catch (_) {} };
     const sendLatencyStage = (stage, sequence) => {
@@ -159,6 +159,16 @@
     const clearInitAppendTimeout = () => { if (initAppendTimeout) { global.clearTimeout(initAppendTimeout); initAppendTimeout = undefined; } };
     const clearPlayTimeout = () => { if (playTimeout) { global.clearTimeout(playTimeout); playTimeout = undefined; } };
     const clearRecoveryTimeout = () => { if (lastPlayback.recoveryTimeout) { global.clearTimeout(lastPlayback.recoveryTimeout); lastPlayback.recoveryTimeout = undefined; } };
+    const clearVideoForReceiverStop = () => {
+      if (receiverStopped) return;
+      receiverStopped = true;
+      clearRecoveryTimeout();
+      pending.length = 0;
+      try { video.pause(); video.removeAttribute("src"); video.load(); } catch (_) {}
+      document.body.classList.remove("media-active");
+      update("Stopped", "Screen broadcast ended");
+      sendMediaResult(event.senderId, request.requestId, "receiver_video_cleared");
+    };
     const stop = (result) => { clearInitAppendTimeout(); clearPlayTimeout(); try { socket && socket.close(); } catch (_) {} sendMediaResult(event.senderId, request.requestId, result); };
     const safePlayRejection = (error) => {
       if (error && error.name === "NotAllowedError") return "play_rejected_not_allowed";
@@ -363,7 +373,11 @@
             }
             stop("binary_envelope_invalid");
           };
-          socket.onerror = () => stop("websocket_failed"); socket.onclose = () => { if (!firstRendered) sendMediaResult(event.senderId, request.requestId, "websocket_closed"); };
+          socket.onerror = () => stop("websocket_failed"); socket.onclose = () => {
+            sendMediaResult(event.senderId, request.requestId, "receiver_stop_received");
+            clearVideoForReceiverStop();
+            if (!firstRendered) sendMediaResult(event.senderId, request.requestId, "websocket_closed");
+          };
           sendMediaResult(event.senderId, request.requestId, "media_socket_connecting");
         } catch (_) { stop("sourcebuffer_failed"); }
       }, { once: true });
@@ -542,6 +556,6 @@
     context.start(options);
     update("Checking", "Testing receiver capabilities before one endpoint probe");
   }
-  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, makeLatencyStage, canConfirmFirstRendered, createMediaCreditEmitter, capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }) });
+  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, makeLatencyStage, canConfirmFirstRendered, createMediaCreditEmitter, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }) });
   if (typeof document !== "undefined") document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", boot, { once: true }) : boot();
 })(globalThis);
