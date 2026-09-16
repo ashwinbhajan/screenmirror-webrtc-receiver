@@ -97,6 +97,13 @@ test("confirms first render only after a presented video frame", () => {
   assert.equal(gate.canConfirmFirstRendered(true, true, { presentedFrames: 2 }), false);
 });
 
+test("prefers media-time correlation and falls back only to appended fragment order", () => {
+  const gate = receiver();
+  assert.equal(gate.renderedCorrelationStrategy(true, true), "media_time");
+  assert.equal(gate.renderedCorrelationStrategy(false, true), "append_order");
+  assert.equal(gate.renderedCorrelationStrategy(false, false), "unavailable");
+});
+
 test("emits positive, monotonic media-credit sequences with receiver diagnostics", () => {
   const diagnostics = [];
   const messages = [];

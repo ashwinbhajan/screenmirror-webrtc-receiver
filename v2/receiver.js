@@ -93,6 +93,11 @@
   function canConfirmFirstRendered(firstRendered, firstMediaAppended, metadata) {
     return !firstRendered && firstMediaAppended && Number.isFinite(metadata && metadata.presentedFrames) && metadata.presentedFrames > 0;
   }
+  function renderedCorrelationStrategy(hasExactMatch, hasOrderedMatch) {
+    if (hasExactMatch) return "media_time";
+    if (hasOrderedMatch) return "append_order";
+    return "unavailable";
+  }
   function send(senderId, requestId, result) {
     context.sendCustomMessage(NAMESPACE, senderId, makeResult(requestId, result));
   }
@@ -132,7 +137,7 @@
     const pending = []; const maxPending = 8;
     const flowGeneration = 1; const initialCredits = 8; let mediaReadySent = false;
     let source; let buffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let lastAppendingSequence = 0; let firstRendered = false; let playAttempted = false; let initialSeekRequested = false; let initialSeekCompleted = false; let recoverySeekPending = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let playTimeout; let receiverStopped = false; let stallThresholdMs = 1500; let recoveryTailSeconds = 0.05; let recoveryMinimumLeadSeconds = 0.05; let recoveryTimeoutMs = 3000; let lastPlayback = { time: 0, advancedAt: performance.now(), recoveryAwaitingProgress: false, recoveryTimeout: undefined };
-    const latencyCorrelations = new Map(); let latencyFallback = false;
+    const latencyCorrelations = new Map(); const appendedCorrelations = []; let uncorrelatedRenderedFrames = 0; let latencyFallback = false;
     const sendLatency = (value) => { try { if (socket && socket.readyState === 1) socket.send(JSON.stringify(value)); } catch (_) {} };
     const sendLatencyStage = (stage, sequence) => {
       const message = makeLatencyStage(flowGeneration, sequence, stage, performance.now(), Math.round(bufferedLead(video) * 1000), Math.max(0, Math.min(maxPending, pending.length)));
@@ -152,7 +157,19 @@
       confirmFirstRendered(metadata);
       let nearest = null;
       for (const item of latencyCorrelations.values()) { const distance = Math.abs(item.mediaTime - metadata.mediaTime); if (distance <= 0.5 && (!nearest || distance < nearest.distance)) nearest = { ...item, distance }; }
-      if (!nearest) return; latencyCorrelations.delete(nearest.sequence);
+      let strategy = renderedCorrelationStrategy(!!nearest, appendedCorrelations.length > 0);
+      if (!nearest && appendedCorrelations.length) nearest = appendedCorrelations.shift();
+      if (!nearest) {
+        if (uncorrelatedRenderedFrames < 8) {
+          uncorrelatedRenderedFrames += 1;
+          sendMediaResult(event.senderId, request.requestId, "rendered_frame_uncorrelated_no_fragment_match");
+        }
+        return;
+      }
+      latencyCorrelations.delete(nearest.sequence);
+      const appendedIndex = appendedCorrelations.findIndex((item) => item.sequence === nearest.sequence);
+      if (appendedIndex >= 0) appendedCorrelations.splice(appendedIndex, 1);
+      if (strategy === "append_order") sendMediaResult(event.senderId, request.requestId, "rendered_frame_correlated_append_order");
       sendLatency({ type: "renderedFrame", generation: nearest.generation, sequence: nearest.sequence, receiverTimeMs: now, mediaTimeMs: Math.round(metadata.mediaTime * 1000), presentedFrames: Number.isFinite(metadata.presentedFrames) ? metadata.presentedFrames : 0, bufferLeadMs: Math.round(bufferedLead(video) * 1000) });
     };
     const installFrameObserver = () => {
@@ -323,6 +340,11 @@
               appendedFragments += 1;
               sendLatencyStage("append_ended", lastAppendingSequence);
               sendMediaResult(event.senderId, request.requestId, "media_append_updateend");
+              const appendedCorrelation = latencyCorrelations.get(lastAppendingSequence);
+              if (appendedCorrelation) {
+                appendedCorrelations.push(appendedCorrelation);
+                if (appendedCorrelations.length > 64) appendedCorrelations.shift();
+              }
               if (mediaReadySent) emitMediaCredit();
               playbackTelemetry("first_media_append");
             }
@@ -561,6 +583,6 @@
     context.start(options);
     update("Checking", "Testing receiver capabilities before one endpoint probe");
   }
-  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, makeLatencyStage, canConfirmFirstRendered, createMediaCreditEmitter, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }) });
+  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, makeLatencyStage, canConfirmFirstRendered, renderedCorrelationStrategy, createMediaCreditEmitter, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }) });
   if (typeof document !== "undefined") document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", boot, { once: true }) : boot();
 })(globalThis);
