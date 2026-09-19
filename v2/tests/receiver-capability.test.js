@@ -61,7 +61,7 @@ test("does not change credit emission while adding playback recovery helpers", (
 
 test("declares bounded receiver-stop cleanup diagnostics", () => {
   const gate = receiver();
-  assert.equal(gate.receiverRevision, "001e6806");
+  assert.equal(gate.receiverRevision, "455fec4b");
   assert.deepEqual(JSON.parse(JSON.stringify(gate.receiverStopDiagnostics)), ["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown"]);
 });
 
@@ -175,8 +175,32 @@ test("control before append and during append both retain correlation", () => {
     const fragment = tracker.receive(8, 5, 1); tracker.start(fragment, 2);
     if (!early) tracker.control(control, 3);
     tracker.append(fragment, 4); tracker.frame(5, { mediaTime: 5.1, presentedFrames: 1 });
-    assert.equal(frames.length, 1); assert.equal(stages.length, 3); assert.equal(diagnostics.length, 0);
+    assert.equal(frames.length, 1); assert.equal(stages.length, 3);
+    assert.equal(diagnostics.length, 0);
   }
+});
+
+test("nearest control and presentation range match tolerate rounded media timestamps", () => {
+  const { tracker, frames, diagnostics } = correlationHarness();
+  const fragment = tracker.receive(41, 20, 0);
+  tracker.start(fragment, 1); tracker.append(fragment, 2);
+  tracker.control({ generation: 1, sequence: 41, mediaTimeMs: 20240 }, 3);
+  tracker.frame(4, { mediaTime: 20.22, presentedFrames: 1 });
+  assert.equal(frames.length, 1);
+  assert.equal(frames[0][2].sequence, 41);
+  assert.deepEqual(diagnostics, ["frame_correlation_late_bound"]);
+});
+
+test("failed control matching emits bounded numeric comparison diagnostics", () => {
+  const { tracker, diagnostics } = correlationHarness();
+  const fragment = tracker.receive(7, 3, 0);
+  tracker.start(fragment, 1); tracker.append(fragment, 2);
+  for (let i = 0; i < 20; i += 1) {
+    tracker.control({ generation: 1, sequence: i + 1, mediaTimeMs: 100000 + i * 1000 }, 3 + i);
+  }
+  const comparisons = diagnostics.filter((value) => value.startsWith("frame_correlation_control_no_match_"));
+  assert.equal(comparisons.length, 8);
+  assert.match(comparisons[0], /controlMediaMs_100000_nearestMediaMs_3000_deltaMs_97000_generationMatch_1_retained_1_appended_1_appendOrder_7/);
 });
 
 test("fragment, orphan-control, callback retention and diagnostics remain bounded", () => {

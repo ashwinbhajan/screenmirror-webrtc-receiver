@@ -2,7 +2,7 @@
   "use strict";
 
   const RECEIVER_VERSION = "2.0.0";
-  const RECEIVER_REVISION = "001e6806";
+  const RECEIVER_REVISION = "455fec4b";
   const PROTOCOL_VERSION = 2;
   const NAMESPACE = "urn:x-cast:com.ashwinbhajan.screenmirror.cmafprobe.v2";
   const MIME_TYPE = 'video/mp4; codecs="avc1.42e01f"';
@@ -101,10 +101,21 @@
   // Diagnostic state only: no media payloads, credits, or queue ownership.
   function createFrameCorrelationTracker(generation, diagnostic, stage, rendered) {
     const fragments = []; const controls = new Map(); const callbacks = [];
-    const maxFragments = 64; const maxCallbacks = 256; const ttlMs = 10000;
+    const maxFragments = 64; const maxCallbacks = 256; const ttlMs = 10000; const mediaToleranceSeconds = 0.5;
     const counts = {}; let closed = false;
     const emit = (reason) => { counts[reason] = (counts[reason] || 0) + 1; if (counts[reason] <= 8) diagnostic(reason); };
+    let comparisonDiagnostics = 0;
     const fail = () => emit("rendered_frame_uncorrelated_no_fragment_match");
+    const nearestFragment = (mediaTime, candidates) => candidates.reduce((best, item) => {
+      const delta = Math.abs(item.mediaTime - mediaTime);
+      return !best || delta < best.delta ? { item, delta } : best;
+    }, null);
+    const emitComparison = (prefix, control, candidate, retained) => {
+      if (comparisonDiagnostics >= 8) return;
+      comparisonDiagnostics += 1;
+      const nearest = candidate ? candidate.item : null;
+      diagnostic(`${prefix}_controlMediaMs_${Math.round(control.mediaTime * 1000)}_nearestMediaMs_${nearest ? Math.round(nearest.mediaTime * 1000) : "na"}_deltaMs_${candidate ? Math.round(candidate.delta * 1000) : "na"}_generationMatch_${control.generation === generation ? 1 : 0}_retained_${retained}_appended_${nearest && nearest.appendedAt !== undefined ? 1 : 0}_appendOrder_${nearest ? nearest.id : "na"}`);
+    };
     const expire = (now) => {
       while (fragments.length && (now - fragments[0].receivedAt >= ttlMs || fragments.length > maxFragments)) {
         const item = fragments.shift();
@@ -125,9 +136,19 @@
       const appended = fragments.filter((item) => item.appendedAt !== undefined && item.appendedAt <= frame.now);
       // Match the actual fragment's decode-time interval before using ordered fallback.
       const exact = appended.find((item, index) => frame.metadata.mediaTime >= item.mediaTime - 0.001 &&
-        frame.metadata.mediaTime < (appended[index + 1] ? appended[index + 1].mediaTime : item.mediaTime + 0.5));
+        frame.metadata.mediaTime < (appended[index + 1] ? appended[index + 1].mediaTime : item.mediaTime + mediaToleranceSeconds));
       let item = exact;
-      if (!item) item = appended.find((candidate) => !candidate.sent);
+      if (!item) {
+        const nearest = nearestFragment(frame.metadata.mediaTime, appended.filter((candidate) => !candidate.sent));
+        if (nearest && nearest.delta <= mediaToleranceSeconds) item = nearest.item;
+      }
+      // If the callback's media time is outside the retained range, use the
+      // oldest appended correlated fragment as the bounded ordered fallback.
+      // This is valid only when an exact control binding already exists.
+      if (!item && !appended.some((candidate) => !candidate.correlation && !candidate.sent)) {
+        item = appended.find((candidate) => candidate.correlation && !candidate.sent);
+      }
+      if (!item) emitComparison("frame_correlation_render_no_match", { generation, mediaTime: frame.metadata.mediaTime }, nearestFragment(frame.metadata.mediaTime, appended), fragments.length);
       if (!item || !item.correlation) return false;
       if (!item.sent) { item.sent = true; rendered(frame.now, frame.metadata, item.correlation); }
       return true;
@@ -139,7 +160,8 @@
         expire(now);
         const item = { id, mediaTime, receivedAt: now, metrics: { received: metrics } };
         fragments.push(item); expire(now);
-        const control = Array.from(controls.values()).find((value) => Math.abs(value.mediaTime - mediaTime) <= 0.001);
+        const candidate = nearestFragment(mediaTime, Array.from(controls.values()));
+        const control = candidate && candidate.delta <= mediaToleranceSeconds ? candidate.item : null;
         if (control) bind(item, control);
         return item;
       },
@@ -149,9 +171,16 @@
         if (closed || value.generation !== generation || value.sequence <= 0 || !Number.isFinite(value.mediaTimeMs)) return;
         expire(now);
         const control = { generation, sequence: value.sequence, mediaTime: value.mediaTimeMs / 1000, at: now };
-        const item = fragments.find((candidate) => !candidate.correlation && Math.abs(candidate.mediaTime - control.mediaTime) <= 0.001);
-        if (item) { bind(item, control); retry(); }
-        else { controls.set(control.sequence, control); if (controls.size > maxFragments) controls.delete(controls.keys().next().value); }
+        const candidate = nearestFragment(control.mediaTime, fragments.filter((item) => !item.correlation));
+        if (candidate && candidate.delta <= mediaToleranceSeconds) { bind(candidate.item, control); retry(); }
+        else {
+          if (!fragments.length) {
+            controls.set(control.sequence, control); if (controls.size > maxFragments) controls.delete(controls.keys().next().value);
+            return;
+          }
+          emitComparison("frame_correlation_control_no_match", control, nearestFragment(control.mediaTime, fragments), fragments.length);
+          controls.set(control.sequence, control); if (controls.size > maxFragments) controls.delete(controls.keys().next().value);
+        }
       },
       frame(now, metadata) { if (closed) return; expire(now); const frame = { now, metadata }; if (!match(frame)) { callbacks.push(frame); expire(now); } },
       finish(now) { if (closed) return; expire(now); retry(); while (callbacks.length) { callbacks.shift(); fail(); } closed = true; fragments.length = 0; controls.clear(); },
