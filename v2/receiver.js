@@ -2,7 +2,7 @@
   "use strict";
 
   const RECEIVER_VERSION = "2.0.0";
-  const RECEIVER_REVISION = "4977962a";
+  const RECEIVER_REVISION = "c21343b1";
   const PROTOCOL_VERSION = 2;
   const NAMESPACE = "urn:x-cast:com.ashwinbhajan.screenmirror.cmafprobe.v2";
   const MIME_TYPE = 'video/mp4; codecs="avc1.42e01f"';
@@ -114,7 +114,7 @@
       if (comparisonDiagnostics >= 8) return;
       comparisonDiagnostics += 1;
       const nearest = candidate ? candidate.item : null;
-      diagnostic(`${prefix}_controlMediaMs_${Math.round(control.mediaTime * 1000)}_nearestMediaMs_${nearest ? Math.round(nearest.mediaTime * 1000) : "na"}_deltaMs_${candidate ? Math.round(candidate.delta * 1000) : "na"}_generationMatch_${control.generation === generation ? 1 : 0}_retained_${retained}_appended_${nearest && nearest.appendedAt !== undefined ? 1 : 0}_appendOrder_${nearest ? nearest.id : "na"}`);
+      diagnostic(`${prefix}_controlSeq_${Number.isInteger(control.sequence) ? control.sequence : "na"}_controlFragmentSeq_${Number.isInteger(control.fragmentSequence) ? control.fragmentSequence : "na"}_controlMediaMs_${Math.round(control.mediaTime * 1000)}_nearestMediaMs_${nearest ? Math.round(nearest.mediaTime * 1000) : "na"}_deltaMs_${candidate ? Math.round(candidate.delta * 1000) : "na"}_generationMatch_${control.generation === generation ? 1 : 0}_retained_${retained}_appended_${nearest && nearest.appendedAt !== undefined ? 1 : 0}_appendOrder_${nearest ? nearest.id : "na"}`);
     };
     const expire = (now) => {
       while (fragments.length && (now - fragments[0].receivedAt >= ttlMs || fragments.length > maxFragments)) {
@@ -163,7 +163,7 @@
         expire(now);
         const item = { id, mediaTime, receivedAt: now, metrics: { received: metrics } };
         fragments.push(item); expire(now);
-        const controlByFragmentID = controls.get(id);
+        const controlByFragmentID = Array.from(controls.values()).find((control) => control.fragmentSequence === id) || controls.get(id);
         const candidate = controlByFragmentID
           ? { item: controlByFragmentID, delta: Math.abs(controlByFragmentID.mediaTime - mediaTime) }
           : nearestFragment(mediaTime, Array.from(controls.values()));
@@ -176,8 +176,8 @@
       control(value, now) {
         if (closed || value.generation !== generation || value.sequence <= 0 || !Number.isFinite(value.mediaTimeMs)) return;
         expire(now);
-        const control = { generation, sequence: value.sequence, mediaTime: value.mediaTimeMs / 1000, at: now };
-        const fragmentByID = fragments.find((item) => !item.correlation && item.id === control.sequence);
+        const control = { generation, sequence: value.sequence, fragmentSequence: Number.isInteger(value.fragmentSequence) ? value.fragmentSequence : null, mediaTime: value.mediaTimeMs / 1000, at: now };
+        const fragmentByID = fragments.find((item) => !item.correlation && item.id === (control.fragmentSequence || control.sequence));
         const candidate = fragmentByID
           ? { item: fragmentByID, delta: Math.abs(fragmentByID.mediaTime - control.mediaTime) }
           : nearestFragment(control.mediaTime, fragments.filter((item) => !item.correlation));

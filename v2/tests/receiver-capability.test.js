@@ -61,7 +61,7 @@ test("does not change credit emission while adding playback recovery helpers", (
 
 test("declares bounded receiver-stop cleanup diagnostics", () => {
   const gate = receiver();
-  assert.equal(gate.receiverRevision, "4977962a");
+  assert.equal(gate.receiverRevision, "c21343b1");
   assert.deepEqual(JSON.parse(JSON.stringify(gate.receiverStopDiagnostics)), ["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown"]);
 });
 
@@ -203,6 +203,16 @@ test("fragment sequence identity wins when control media time is offset", () => 
   assert.equal(diagnostics[0], "frame_correlation_late_bound");
 });
 
+test("explicit fragment sequence binds when latency and envelope sequences diverge", () => {
+  const { tracker, frames } = correlationHarness();
+  const fragment = tracker.receive(71, 30, 0);
+  tracker.start(fragment, 1); tracker.append(fragment, 2);
+  tracker.control({ generation: 1, sequence: 7, fragmentSequence: 71, mediaTimeMs: 24000 }, 3);
+  tracker.frame(4, { mediaTime: 30.1, presentedFrames: 1 });
+  assert.equal(frames.length, 1);
+  assert.equal(frames[0][2].sequence, 7, "sender latency sequence remains the stage and latency key");
+});
+
 test("failed control matching emits bounded numeric comparison diagnostics", () => {
   const { tracker, diagnostics } = correlationHarness();
   const fragment = tracker.receive(7, 3, 0);
@@ -212,7 +222,7 @@ test("failed control matching emits bounded numeric comparison diagnostics", () 
   }
   const comparisons = diagnostics.filter((value) => value.startsWith("frame_correlation_control_no_match_"));
   assert.equal(comparisons.length, 8);
-  assert.match(comparisons[0], /controlMediaMs_100000_nearestMediaMs_3000_deltaMs_97000_generationMatch_1_retained_1_appended_1_appendOrder_7/);
+  assert.match(comparisons[0], /controlSeq_1_controlFragmentSeq_na_controlMediaMs_100000_nearestMediaMs_3000_deltaMs_97000_generationMatch_1_retained_1_appended_1_appendOrder_7/);
 });
 
 test("fragment, orphan-control, callback retention and diagnostics remain bounded", () => {
