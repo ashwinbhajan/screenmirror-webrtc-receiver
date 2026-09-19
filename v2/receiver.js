@@ -2,7 +2,7 @@
   "use strict";
 
   const RECEIVER_VERSION = "2.0.0";
-  const RECEIVER_REVISION = "corr-fragseq-20260919-idlefix";
+  const RECEIVER_REVISION = "corr-fragseq-20260919-normalstop";
   const PROTOCOL_VERSION = 2;
   const NAMESPACE = "urn:x-cast:com.ashwinbhajan.screenmirror.cmafprobe.v2";
   const MIME_TYPE = 'video/mp4; codecs="avc1.42e01f"';
@@ -334,6 +334,7 @@
       showScreen(screen);
       sendMediaResult(event.senderId, request.requestId, "receiver_video_cleared");
       sendMediaResult(event.senderId, request.requestId, "receiver_idle_screen_shown");
+      if (screen === "stopped") sendMediaResult(event.senderId, request.requestId, "receiver_casting_stopped_screen_shown");
       if (screen === "lost") sendMediaResult(event.senderId, request.requestId, "receiver_connection_lost_screen_shown");
     };
     const stop = (result) => { clearInitAppendTimeout(); clearPlayTimeout(); try { socket && socket.close(); } catch (_) {} sendMediaResult(event.senderId, request.requestId, result); };
@@ -518,6 +519,12 @@
             if (typeof message.data === "string") {
               const control = parse(message.data); if (!control) { stop("protocol_error"); return; }
               if (control.type === "readyForMedia") return;
+              if (control.type === "normalStop" && control.protocolVersion === PROTOCOL_VERSION && Object.keys(control).length === 2) {
+                sendMediaResult(event.senderId, request.requestId, "receiver_stop_received");
+                clearVideoForReceiverStop("stopped");
+                try { socket.close(1000, "normal_stop"); } catch (_) {}
+                return;
+              }
               if (control.type === "clockPing" && Number.isFinite(control.t1) && Number.isInteger(control.sequence)) { const t2 = performance.now(); sendLatency({ type: "clockPong", sequence: control.sequence, t1: control.t1, t2, t3: performance.now() }); return; }
               if (control.type === "frameCorrelation" && Number.isInteger(control.generation) && Number.isInteger(control.sequence) && Number.isFinite(control.mediaTimeMs)) { correlations.control(control, performance.now());
                 if (latencyFallback) {
@@ -546,8 +553,10 @@
           };
           let socketFailed = false;
           socket.onerror = () => { socketFailed = true; stop("websocket_failed"); }; socket.onclose = (closeEvent) => {
-            sendMediaResult(event.senderId, request.requestId, "receiver_stop_received");
-            clearVideoForReceiverStop(closeScreen(closeEvent, socketFailed));
+            if (!receiverStopped) {
+              sendMediaResult(event.senderId, request.requestId, "receiver_stop_received");
+              clearVideoForReceiverStop(closeScreen(closeEvent, socketFailed));
+            }
             if (!firstRendered) sendMediaResult(event.senderId, request.requestId, "websocket_closed");
           };
           sendMediaResult(event.senderId, request.requestId, "media_socket_connecting");
@@ -737,6 +746,6 @@
     context.start(options);
 
   }
-  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ SCREEN_COPY, closeScreen, MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, makeLatencyStage, canConfirmFirstRendered, renderedCorrelationStrategy, createMediaCreditEmitter, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }) });
+  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ SCREEN_COPY, closeScreen, MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, makeLatencyStage, canConfirmFirstRendered, renderedCorrelationStrategy, createMediaCreditEmitter, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }) });
   if (typeof document !== "undefined") document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", boot, { once: true }) : boot();
 })(globalThis);

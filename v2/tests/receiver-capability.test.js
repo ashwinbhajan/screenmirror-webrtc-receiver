@@ -61,8 +61,8 @@ test("does not change credit emission while adding playback recovery helpers", (
 
 test("declares bounded receiver-stop cleanup diagnostics", () => {
   const gate = receiver();
-  assert.equal(gate.receiverRevision, "corr-fragseq-20260919-idlefix");
-  assert.deepEqual(JSON.parse(JSON.stringify(gate.receiverStopDiagnostics)), ["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown"]);
+  assert.equal(gate.receiverRevision, "corr-fragseq-20260919-normalstop");
+  assert.deepEqual(JSON.parse(JSON.stringify(gate.receiverStopDiagnostics)), ["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown"]);
 });
 
 test("retains a bounded GOP history before trimming buffered media", () => {
@@ -288,9 +288,9 @@ test("pacing histogram covers long sessions with explicit overflow", () => {
   assert.equal(summary.render.intervalOverflow, 1); assert.equal(summary.render.maxMs, 10020);
 });
 
-for (const ending of ["normal", "abnormal", "error"]) test(`${ending} socket closure clears video, presents safe copy and preserves pacing`, async () => {
+for (const ending of ["normal", "normalStop", "abnormal", "error"]) test(`${ending} socket closure clears video, presents safe copy and preserves pacing`, async () => {
   const messages = []; const sources = []; const sockets = []; const wire = []; const buffers = []; let receiverListener; let nextFrame; let cancelled = false;
-  const nodes = {}; const classes = new Set(); const cleanup = []; const videoEvents = {};
+  const nodes = {}; const classes = new Set(); const cleanup = []; const closes = []; const videoEvents = {};
   const video = { buffered: { length: 0 }, currentTime: 0, playbackRate: 1, pause() { cleanup.push("pause"); }, load() { cleanup.push("load"); }, removeAttribute(name) { cleanup.push(name); },
     addEventListener(name, callback) { videoEvents[name] = callback; }, requestVideoFrameCallback(callback) { nextFrame = callback; return 42; },
     cancelVideoFrameCallback(id) { cancelled = id === 42; } };
@@ -300,7 +300,7 @@ for (const ending of ["normal", "abnormal", "error"]) test(`${ending} socket clo
     addEventListener(name, callback) { this.listeners[name] = callback; }
     addSourceBuffer() { const buffer = { listeners: {}, addEventListener(name, callback) { this.listeners[name] = callback; }, appendBuffer() {} }; buffers.push(buffer); return buffer; }
   }
-  class WebSocket { constructor() { this.readyState = 1; sockets.push(this); } send(value) { wire.push(JSON.parse(value)); } close() {} }
+  class WebSocket { constructor() { this.readyState = 1; sockets.push(this); } send(value) { wire.push(JSON.parse(value)); } close(code, reason) { closes.push({ code, reason }); } }
   const context = { ArrayBuffer, Uint8Array, DataView, TextEncoder, URL: { createObjectURL: () => "blob:test" }, performance: { now: () => 0 }, setTimeout: () => 1, clearTimeout() {}, MediaSource, WebSocket,
     document: { readyState: "complete", getElementById: (id) => id === "probe-video" ? video : (nodes[id] ||= {}), body: { classList: { add: (name) => classes.add(name), remove: (name) => classes.delete(name) } } },
     cast: { framework: { CastReceiverContext: { getInstance: () => ({ addCustomMessageListener: (_, callback) => { receiverListener = callback; }, start() {}, sendCustomMessage: (_, sender, message) => messages.push({ sender, ...message }) }) }, CastReceiverOptions: function () {}, system: { MessageType: { JSON: "JSON" } } } } };
@@ -339,16 +339,22 @@ for (const ending of ["normal", "abnormal", "error"]) test(`${ending} socket clo
   videoEvents.playing();
   sockets[0].onmessage({ data: JSON.stringify({ type: "frameCorrelation", generation: 1, sequence: 9, mediaTimeMs: 0 }) }); nextFrame(30, { mediaTime: 0.02, presentedFrames: 2 });
   if (ending === "error") sockets[0].onerror();
+  if (ending === "normalStop") sockets[0].onmessage({ data: JSON.stringify({ type: "normalStop", protocolVersion: 2 }) });
   const closeEvent = { code: ending === "abnormal" ? 1006 : 1000, wasClean: ending !== "abnormal" };
-  sockets[0].onclose(closeEvent); sockets[0].onclose(closeEvent);
+  const deliveredClose = ending === "normalStop" ? { code: 1006, wasClean: false } : closeEvent;
+  sockets[0].onclose(deliveredClose); sockets[0].onclose(deliveredClose);
+  const stopped = ending === "normal" || ending === "normalStop";
   assert.deepEqual(cleanup, ["pause", "src", "load"]);
   assert.equal(classes.has("media-active"), false);
   assert.equal(classes.has("receiver-waiting"), false);
   assert.equal(nodes["idle-screen"].hidden, false);
-  assert.equal(nodes["status-title"].textContent, ending === "normal" ? "Casting Stopped" : "Connection Lost");
-  assert.equal(nodes["status-detail"].textContent, ending === "normal" ? "Ready when you are. Start casting again from your iPhone." : "We’re waiting for your iPhone. Check Wi‑Fi and start casting again.");
+  assert.equal(nodes["status-title"].textContent, stopped ? "Casting Stopped" : "Connection Lost");
+  assert.equal(nodes["status-detail"].textContent, stopped ? "Ready when you are. Start casting again from your iPhone." : "We’re waiting for your iPhone. Check Wi‑Fi and start casting again.");
+  assert.equal(messages.filter((value) => value.result === "receiver_stop_received").length, 1);
   assert.equal(messages.filter((value) => value.result === "receiver_idle_screen_shown").length, 1);
-  assert.equal(messages.filter((value) => value.result === "receiver_connection_lost_screen_shown").length, ending === "normal" ? 0 : 1);
+  assert.equal(messages.filter((value) => value.result === "receiver_casting_stopped_screen_shown").length, stopped ? 1 : 0);
+  assert.equal(messages.filter((value) => value.result === "receiver_connection_lost_screen_shown").length, stopped ? 0 : 1);
+  if (ending === "normalStop") assert.deepEqual(closes, [{ code: 1000, reason: "normal_stop" }]);
   videoEvents.playing(); videoEvents.waiting(); videoEvents.stalled();
   assert.equal(nodes["idle-screen"].hidden, false);
   assert.equal(classes.has("receiver-waiting"), false);
