@@ -2,7 +2,7 @@
   "use strict";
 
   const RECEIVER_VERSION = "2.0.0";
-  const RECEIVER_REVISION = "59e54626";
+  const RECEIVER_REVISION = "4977962a";
   const PROTOCOL_VERSION = 2;
   const NAMESPACE = "urn:x-cast:com.ashwinbhajan.screenmirror.cmafprobe.v2";
   const MIME_TYPE = 'video/mp4; codecs="avc1.42e01f"';
@@ -135,20 +135,23 @@
     const match = (frame) => {
       const appended = fragments.filter((item) => item.appendedAt !== undefined && item.appendedAt <= frame.now);
       // Match the actual fragment's decode-time interval before using ordered fallback.
-      const exact = appended.find((item, index) => frame.metadata.mediaTime >= item.mediaTime - 0.001 &&
+      const exact = appended.find((item, index) => item.correlation &&
+        frame.metadata.mediaTime >= item.mediaTime - 0.001 &&
         frame.metadata.mediaTime < (appended[index + 1] ? appended[index + 1].mediaTime : item.mediaTime + mediaToleranceSeconds));
       let item = exact;
+      if (item && item.sent) return true;
       if (!item) {
-        const nearest = nearestFragment(frame.metadata.mediaTime, appended.filter((candidate) => !candidate.sent));
+        const nearest = nearestFragment(frame.metadata.mediaTime, appended.filter((candidate) => candidate.correlation && !candidate.sent));
         if (nearest && nearest.delta <= mediaToleranceSeconds) item = nearest.item;
       }
       // If the callback's media time is outside the retained range, use the
       // oldest appended correlated fragment as the bounded ordered fallback.
       // This is valid only when an exact control binding already exists.
-      if (!item && !appended.some((candidate) => !candidate.correlation && !candidate.sent)) {
+      const unresolvedOlderFragment = appended.some((candidate) => !candidate.correlation && !candidate.sent && candidate.mediaTime <= frame.metadata.mediaTime);
+      if (!item && !unresolvedOlderFragment) {
         item = appended.find((candidate) => candidate.correlation && !candidate.sent);
       }
-      if (!item) emitComparison("frame_correlation_render_no_match", { generation, mediaTime: frame.metadata.mediaTime }, nearestFragment(frame.metadata.mediaTime, appended), fragments.length);
+      if (!item && !unresolvedOlderFragment) emitComparison("frame_correlation_render_no_match", { generation, mediaTime: frame.metadata.mediaTime }, nearestFragment(frame.metadata.mediaTime, appended), fragments.length);
       if (!item || !item.correlation) return false;
       if (!item.sent) { item.sent = true; rendered(frame.now, frame.metadata, item.correlation); }
       return true;

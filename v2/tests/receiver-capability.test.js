@@ -61,7 +61,7 @@ test("does not change credit emission while adding playback recovery helpers", (
 
 test("declares bounded receiver-stop cleanup diagnostics", () => {
   const gate = receiver();
-  assert.equal(gate.receiverRevision, "59e54626");
+  assert.equal(gate.receiverRevision, "4977962a");
   assert.deepEqual(JSON.parse(JSON.stringify(gate.receiverStopDiagnostics)), ["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown"]);
 });
 
@@ -345,7 +345,7 @@ test("ordered fallback waits for older unresolved append instead of consuming a 
   const first = tracker.receive(1, 100, 0); tracker.start(first, 1); tracker.append(first, 2);
   const second = tracker.receive(2, 101, 3); tracker.start(second, 4); tracker.append(second, 5);
   tracker.control({ generation: 1, sequence: 20, mediaTimeMs: 101000 }, 6);
-  tracker.frame(7, { mediaTime: 0, presentedFrames: 1 });
+  tracker.frame(7, { mediaTime: 100, presentedFrames: 1 });
   assert.equal(frames.length, 0);
   tracker.control({ generation: 1, sequence: 10, mediaTimeMs: 100000 }, 8);
   assert.equal(frames.length, 1); assert.equal(frames[0][2].sequence, 10);
