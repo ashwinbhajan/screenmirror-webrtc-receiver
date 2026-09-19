@@ -4,10 +4,7 @@ body { margin: 0; min-height: 100vh; overflow: hidden; background: radial-gradie
 .receiver-status { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 7vh 8vw 12vh; text-align: center; z-index: 2; background: radial-gradient(ellipse at 50% 35%, #1b2b46 0%, #101a2a 38%, #090e18 75%); }
 .receiver-status[hidden] { display: none; }
 .casting-visual { width: clamp(180px, 19vw, 350px); margin-bottom: 3vh; }
-.casting-visual svg { display: block; width: 100%; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
-.tv-outline { stroke: #869bbd; }
-.phone-outline { stroke: #dce9ff; fill: #162238; }
-.signal { stroke: #9bc9f5; }
+.casting-visual img { display: block; width: 100%; height: auto; border-radius: 22%; box-shadow: 0 20px 55px rgba(20, 69, 194, .24); }
 h1 { font-size: clamp(36px, 4.1vw, 80px); font-weight: 600; letter-spacing: -.025em; line-height: 1.15; margin: 0 0 2.2vh; }
 #status-detail { color: #bcc9dd; font-size: clamp(20px, 1.9vw, 38px); line-height: 1.5; max-width: 36em; margin: 0 auto; text-wrap: balance; }
 .waiting-indicator { display: flex; gap: 10px; height: 8px; margin-top: 4.5vh; visibility: hidden; }

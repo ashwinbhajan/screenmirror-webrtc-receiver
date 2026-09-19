@@ -5,21 +5,15 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="dark" />
     <title>Screen Mirror</title>
-    <link rel="stylesheet" href="./styles.css?rev=corr-fragseq-20260919-normalstop2" />
+    <link rel="stylesheet" href="./styles.css?rev=corr-fragseq-20260919-normalstop2-icon" />
     <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
-    <script src="./receiver.js?rev=corr-fragseq-20260919-normalstop2" defer></script>
+    <script src="./receiver.js?rev=corr-fragseq-20260919-normalstop2-icon" defer></script>
   </head>
   <body class="receiver-waiting">
     <video id="probe-video" muted playsinline autoplay aria-hidden="true"></video>
     <main id="idle-screen" class="receiver-status">
       <div class="casting-visual" aria-hidden="true">
-        <svg viewBox="0 0 240 150" fill="none" xmlns="http://www.w3.org/2000/svg">
-          <rect class="tv-outline" x="72" y="20" width="146" height="94" rx="10" />
-          <path class="tv-outline" d="M145 115v14m-28 0h56" />
-          <rect class="phone-outline" x="23" y="62" width="48" height="76" rx="9" />
-          <path class="phone-outline" d="M41 128h12" />
-          <path class="signal" d="M91 83a17 17 0 0 1 17 17m-17-33a33 33 0 0 1 33 33m-33-49a49 49 0 0 1 49 49" />
-        </svg>
+        <img src="./assets/cast-device-icon.png" alt="" />
       </div>
       <div role="status" aria-live="polite" aria-atomic="true">
         <h1 id="status-title">Ready to Cast</h1>

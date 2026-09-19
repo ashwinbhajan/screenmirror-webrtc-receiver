@@ -2,7 +2,7 @@
   "use strict";
 
   const RECEIVER_VERSION = "2.0.0";
-  const RECEIVER_REVISION = "corr-fragseq-20260919-normalstop2";
+  const RECEIVER_REVISION = "corr-fragseq-20260919-normalstop2-icon";
   const PROTOCOL_VERSION = 2;
   const NAMESPACE = "urn:x-cast:com.ashwinbhajan.screenmirror.cmafprobe.v2";
   const MIME_TYPE = 'video/mp4; codecs="avc1.42e01f"';
