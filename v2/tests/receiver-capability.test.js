@@ -61,7 +61,7 @@ test("does not change credit emission while adding playback recovery helpers", (
 
 test("declares bounded receiver-stop cleanup diagnostics", () => {
   const gate = receiver();
-  assert.equal(gate.receiverRevision, "c21343b1");
+  assert.equal(gate.receiverRevision, "corr-fragseq-20260919");
   assert.deepEqual(JSON.parse(JSON.stringify(gate.receiverStopDiagnostics)), ["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown"]);
 });
 
@@ -218,11 +218,11 @@ test("failed control matching emits bounded numeric comparison diagnostics", () 
   const fragment = tracker.receive(7, 3, 0);
   tracker.start(fragment, 1); tracker.append(fragment, 2);
   for (let i = 0; i < 20; i += 1) {
-    tracker.control({ generation: 1, sequence: i + 1, mediaTimeMs: 100000 + i * 1000 }, 3 + i);
+    tracker.control({ generation: 1, sequence: i + 1, mediaTimeMs: 100000 + i * 1000, capturePTS90k: 9_000 + i, captureDelta90k: 30 + i }, 3 + i);
   }
   const comparisons = diagnostics.filter((value) => value.startsWith("frame_correlation_control_no_match_"));
   assert.equal(comparisons.length, 8);
-  assert.match(comparisons[0], /controlSeq_1_controlFragmentSeq_na_controlMediaMs_100000_nearestMediaMs_3000_deltaMs_97000_generationMatch_1_retained_1_appended_1_appendOrder_7/);
+  assert.match(comparisons[0], /controlSeq_1_controlFragmentSeq_na_controlMediaMs_100000_controlCapturePTS90k_9000_controlCaptureDelta90k_30_nearestFragmentSeq_7_nearestMediaMs_3000_deltaMs_97000_generationMatch_1_retained_1_appended_1/);
 });
 
 test("fragment, orphan-control, callback retention and diagnostics remain bounded", () => {
