@@ -61,7 +61,7 @@ test("does not change credit emission while adding playback recovery helpers", (
 
 test("declares bounded receiver-stop cleanup diagnostics", () => {
   const gate = receiver();
-  assert.equal(gate.receiverRevision, "corr-fragseq-20260919-compat3");
+  assert.equal(gate.receiverRevision, "corr-fragseq-20260920-presentation");
   assert.deepEqual(JSON.parse(JSON.stringify(gate.receiverStopDiagnostics)), ["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown"]);
 });
 
@@ -289,7 +289,7 @@ test("pacing histogram covers long sessions with explicit overflow", () => {
 });
 
 for (const ending of ["normal", "normalStop", "abnormal", "error"]) test(`${ending} socket closure clears video, presents safe copy and preserves pacing`, async () => {
-  const messages = []; const sources = []; const sockets = []; const wire = []; const buffers = []; let receiverListener; let nextFrame; let cancelled = false;
+  const messages = []; const sources = []; const sockets = []; const wire = []; const buffers = []; let receiverListener; let nextFrame; let cancelled = false; let now = 0;
   const nodes = {}; const classes = new Set(); const cleanup = []; const closes = []; const videoEvents = {}; const timers = [];
   const schedule = (callback) => { timers.push(callback); return timers.length; };
   const cancel = (id) => { timers[id - 1] = null; };
@@ -304,7 +304,7 @@ for (const ending of ["normal", "normalStop", "abnormal", "error"]) test(`${endi
     addSourceBuffer() { const buffer = { listeners: {}, addEventListener(name, callback) { this.listeners[name] = callback; }, appendBuffer() {} }; buffers.push(buffer); return buffer; }
   }
   class WebSocket { constructor() { this.readyState = 1; sockets.push(this); } send(value) { wire.push(JSON.parse(value)); } close(code, reason) { closes.push({ code, reason }); } }
-  const context = { ArrayBuffer, Uint8Array, DataView, TextEncoder, URL: { createObjectURL: () => "blob:test" }, performance: { now: () => 0 }, setTimeout: schedule, clearTimeout: cancel, MediaSource, WebSocket,
+  const context = { ArrayBuffer, Uint8Array, DataView, TextEncoder, URL: { createObjectURL: () => "blob:test" }, performance: { now: () => now }, setTimeout: schedule, clearTimeout: cancel, MediaSource, WebSocket,
     document: { readyState: "complete", getElementById: (id) => id === "probe-video" ? video : (nodes[id] ||= {}), body: { classList: { add: (name) => classes.add(name), remove: (name) => classes.delete(name) } } },
     cast: { framework: { CastReceiverContext: { getInstance: () => ({ addCustomMessageListener: (_, callback) => { receiverListener = callback; }, start() {}, sendCustomMessage: (_, sender, message) => messages.push({ sender, ...message }) }) }, CastReceiverOptions: function () {}, system: { MessageType: { JSON: "JSON" } } } } };
   // URL must remain constructible for endpoint validation.
@@ -336,6 +336,10 @@ for (const ending of ["normal", "normalStop", "abnormal", "error"]) test(`${endi
   nextFrame(10, { mediaTime: 0, presentedFrames: 1 });
   videoEvents.waiting();
   assert.equal(nodes["status-title"].textContent, "Ready to Cast");
+  runPendingTimer();
+  assert.equal(nodes["idle-screen"].hidden, true, "a transient waiting event must not replace visible video");
+  now = 1500;
+  videoEvents.waiting();
   runPendingTimer();
   assert.equal(nodes["status-title"].textContent, "Reconnecting…");
   assert.equal(nodes["status-detail"].textContent, "Keep the app open on your iPhone.");
@@ -375,6 +379,14 @@ for (const ending of ["normal", "normalStop", "abnormal", "error"]) test(`${endi
   assert.ok(messages.findIndex((value) => value.result === "receiver_video_cleared") > messages.indexOf(summary[2]));
   nextFrame(50, { mediaTime: 0.04, presentedFrames: 3 });
   assert.equal(messages.filter((value) => value.result && value.result.startsWith("frame_pacing_summary_")).length, 3);
+});
+
+test("receiver presentation waits for sustained missing playback before showing reconnecting", () => {
+  const gate = receiver();
+  assert.equal(gate.shouldShowReconnectingScreen(true, false, 1000, 1349, 1500), false);
+  assert.equal(gate.shouldShowReconnectingScreen(true, false, 1000, 2500, 1500), true);
+  assert.equal(gate.shouldShowReconnectingScreen(false, false, 1000, 3000, 1500), false);
+  assert.equal(gate.shouldShowReconnectingScreen(true, true, 1000, 3000, 1500), false);
 });
 
 test("late-bound stage replay preserves original buffer lead and queue snapshots", () => {

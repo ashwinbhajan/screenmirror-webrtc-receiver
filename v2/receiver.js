@@ -2,7 +2,7 @@
   "use strict";
 
   const RECEIVER_VERSION = "2.0.0";
-  const RECEIVER_REVISION = "corr-fragseq-20260919-compat3";
+  const RECEIVER_REVISION = "corr-fragseq-20260920-presentation";
   const PROTOCOL_VERSION = 2;
   const NAMESPACE = "urn:x-cast:com.ashwinbhajan.screenmirror.cmafprobe.v2";
   const MIME_TYPE = 'video/mp4; codecs="avc1.42e01f"';
@@ -103,6 +103,12 @@
   }
   function canConfirmFirstRendered(firstRendered, firstMediaAppended, metadata) {
     return !firstRendered && firstMediaAppended && Number.isFinite(metadata && metadata.presentedFrames) && metadata.presentedFrames > 0;
+  }
+  // Presentation-only gate. `waiting` is commonly emitted around a normal MSE
+  // append; it must not replace visible video with the casting screen unless
+  // playback has genuinely stopped advancing for the existing stall interval.
+  function shouldShowReconnectingScreen(firstRendered, receiverStopped, playbackAdvancedAt, now, stallThresholdMs) {
+    return !!firstRendered && !receiverStopped && Number.isFinite(playbackAdvancedAt) && Number.isFinite(now) && Number.isFinite(stallThresholdMs) && now - playbackAdvancedAt >= stallThresholdMs;
   }
   function renderedCorrelationStrategy(hasExactMatch, hasOrderedMatch) {
     if (hasExactMatch) return "media_time";
@@ -326,8 +332,8 @@
       if (receiverStopped || !firstRendered || reconnectingScreenTimer) return;
       reconnectingScreenTimer = global.setTimeout(() => {
         reconnectingScreenTimer = undefined;
-        if (!receiverStopped && firstRendered) showScreen("reconnecting");
-      }, 350);
+        if (shouldShowReconnectingScreen(firstRendered, receiverStopped, lastPlayback.advancedAt, performance.now(), stallThresholdMs)) showScreen("reconnecting");
+      }, stallThresholdMs);
     };
     const clearVideoForReceiverStop = (screen) => {
       if (receiverStopped) return;
@@ -757,6 +763,6 @@
     context.start(options);
 
   }
-  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ SCREEN_COPY, closeScreen, MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, makeLatencyStage, canConfirmFirstRendered, renderedCorrelationStrategy, createMediaCreditEmitter, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }) });
+  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ SCREEN_COPY, closeScreen, MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, makeLatencyStage, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }) });
   if (typeof document !== "undefined") document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", boot, { once: true }) : boot();
 })(globalThis);
