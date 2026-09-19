@@ -2,7 +2,7 @@
   "use strict";
 
   const RECEIVER_VERSION = "2.0.0";
-  const RECEIVER_REVISION = "455fec4b";
+  const RECEIVER_REVISION = "59e54626";
   const PROTOCOL_VERSION = 2;
   const NAMESPACE = "urn:x-cast:com.ashwinbhajan.screenmirror.cmafprobe.v2";
   const MIME_TYPE = 'video/mp4; codecs="avc1.42e01f"';
@@ -160,9 +160,12 @@
         expire(now);
         const item = { id, mediaTime, receivedAt: now, metrics: { received: metrics } };
         fragments.push(item); expire(now);
-        const candidate = nearestFragment(mediaTime, Array.from(controls.values()));
+        const controlByFragmentID = controls.get(id);
+        const candidate = controlByFragmentID
+          ? { item: controlByFragmentID, delta: Math.abs(controlByFragmentID.mediaTime - mediaTime) }
+          : nearestFragment(mediaTime, Array.from(controls.values()));
         const control = candidate && candidate.delta <= mediaToleranceSeconds ? candidate.item : null;
-        if (control) bind(item, control);
+        if (controlByFragmentID || control) bind(item, controlByFragmentID || control);
         return item;
       },
       start(item, now, metrics) { if (!item || closed) return; item.startedAt = now; item.metrics.append_started = metrics; if (item.correlation) stage("append_started", item.correlation.sequence, now, metrics); },
@@ -171,8 +174,11 @@
         if (closed || value.generation !== generation || value.sequence <= 0 || !Number.isFinite(value.mediaTimeMs)) return;
         expire(now);
         const control = { generation, sequence: value.sequence, mediaTime: value.mediaTimeMs / 1000, at: now };
-        const candidate = nearestFragment(control.mediaTime, fragments.filter((item) => !item.correlation));
-        if (candidate && candidate.delta <= mediaToleranceSeconds) { bind(candidate.item, control); retry(); }
+        const fragmentByID = fragments.find((item) => !item.correlation && item.id === control.sequence);
+        const candidate = fragmentByID
+          ? { item: fragmentByID, delta: Math.abs(fragmentByID.mediaTime - control.mediaTime) }
+          : nearestFragment(control.mediaTime, fragments.filter((item) => !item.correlation));
+        if (fragmentByID || (candidate && candidate.delta <= mediaToleranceSeconds)) { bind(fragmentByID || candidate.item, control); retry(); }
         else {
           if (!fragments.length) {
             controls.set(control.sequence, control); if (controls.size > maxFragments) controls.delete(controls.keys().next().value);

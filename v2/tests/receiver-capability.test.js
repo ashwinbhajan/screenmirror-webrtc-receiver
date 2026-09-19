@@ -61,7 +61,7 @@ test("does not change credit emission while adding playback recovery helpers", (
 
 test("declares bounded receiver-stop cleanup diagnostics", () => {
   const gate = receiver();
-  assert.equal(gate.receiverRevision, "455fec4b");
+  assert.equal(gate.receiverRevision, "59e54626");
   assert.deepEqual(JSON.parse(JSON.stringify(gate.receiverStopDiagnostics)), ["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown"]);
 });
 
@@ -191,6 +191,18 @@ test("nearest control and presentation range match tolerate rounded media timest
   assert.deepEqual(diagnostics, ["frame_correlation_late_bound"]);
 });
 
+test("fragment sequence identity wins when control media time is offset", () => {
+  const { tracker, frames, diagnostics } = correlationHarness();
+  const fragment = tracker.receive(6, 13.968, 0);
+  tracker.start(fragment, 1); tracker.append(fragment, 2);
+  tracker.control({ generation: 1, sequence: 6, mediaTimeMs: 13434 }, 3);
+  tracker.frame(4, { mediaTime: 13.95, presentedFrames: 1 });
+  assert.equal(frames.length, 1);
+  assert.equal(frames[0][2].sequence, 6);
+  assert.equal(diagnostics.length, 1, "binding after append remains explicitly diagnosed");
+  assert.equal(diagnostics[0], "frame_correlation_late_bound");
+});
+
 test("failed control matching emits bounded numeric comparison diagnostics", () => {
   const { tracker, diagnostics } = correlationHarness();
   const fragment = tracker.receive(7, 3, 0);
@@ -207,7 +219,7 @@ test("fragment, orphan-control, callback retention and diagnostics remain bounde
   const { tracker, diagnostics } = correlationHarness();
   for (let i = 0; i < 1000; i += 1) {
     tracker.receive(i, i, i);
-    tracker.control({ generation: 1, sequence: i + 1, mediaTimeMs: (i + 10000) * 1000 }, i);
+    tracker.control({ generation: 1, sequence: i + 1001, mediaTimeMs: (i + 10000) * 1000 }, i);
     tracker.frame(i, { mediaTime: -1, presentedFrames: i });
   }
   assert.equal(tracker.snapshot().fragments, 64);
