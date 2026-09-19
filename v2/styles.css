@@ -6,7 +6,6 @@ body { margin: 0; min-height: 100vh; overflow: hidden; background: #101a2a; back
 .casting-visual { position: relative; width: 240px; max-width: 44vw; margin-bottom: 3vh; }
 .casting-visual { width: clamp(180px, 19vw, 350px); }
 .casting-visual img { display: block; width: 100%; height: auto; border-radius: 22%; box-shadow: 0 20px 55px rgba(20, 69, 194, .24); }
-.casting-fallback { align-items: center; background: #183b89; border: 2px solid #dce9ff; border-radius: 22%; color: #fff; display: flex; font-size: 22px; font-weight: 600; inset: 0; justify-content: center; position: absolute; text-align: center; }
 h1 { font-size: 48px; font-size: clamp(36px, 4.1vw, 80px); font-weight: 600; letter-spacing: -.025em; line-height: 1.15; margin: 0 0 2.2vh; }
 #status-detail { color: #d5deed; font-size: 24px; font-size: clamp(20px, 1.9vw, 38px); line-height: 1.5; max-width: 36em; margin: 0 auto; }
 .waiting-indicator { display: flex; gap: 10px; height: 8px; margin-top: 4.5vh; visibility: hidden; }
