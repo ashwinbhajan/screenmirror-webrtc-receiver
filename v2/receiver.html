@@ -5,15 +5,15 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="dark" />
     <title>Screen Mirror</title>
-    <link rel="stylesheet" href="./styles.css?rev=corr-fragseq-20260919-compat" />
+    <link rel="stylesheet" href="./styles.css?rev=corr-fragseq-20260919-compat2" />
     <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
-    <script src="./receiver.js?rev=corr-fragseq-20260919-compat" defer></script>
+    <script src="./receiver.js?rev=corr-fragseq-20260919-compat2" defer></script>
   </head>
   <body class="receiver-waiting">
     <video id="probe-video" muted playsinline autoplay aria-hidden="true"></video>
     <main id="idle-screen" class="receiver-status">
       <div class="casting-visual" aria-hidden="true">
-        <img src="./assets/cast-device-icon.png" alt="Screen Mirror" onerror="this.hidden=true;this.nextElementSibling.hidden=false" />
+        <img src="./assets/cast-device-icon.png?rev=corr-fragseq-20260919-compat2" alt="Screen Mirror" onerror="this.hidden=true;this.nextElementSibling.hidden=false" />
         <span class="casting-fallback" hidden>Screen Mirror</span>
       </div>
       <div role="status" aria-live="polite" aria-atomic="true">
