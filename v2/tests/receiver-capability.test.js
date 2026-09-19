@@ -288,10 +288,11 @@ test("pacing histogram covers long sessions with explicit overflow", () => {
   assert.equal(summary.render.intervalOverflow, 1); assert.equal(summary.render.maxMs, 10020);
 });
 
-test("normal socket stop exports pacing through same-request CAF messages and cancels callbacks", async () => {
+for (const ending of ["normal", "abnormal", "error"]) test(`${ending} socket closure clears video, presents safe copy and preserves pacing`, async () => {
   const messages = []; const sources = []; const sockets = []; const wire = []; const buffers = []; let receiverListener; let nextFrame; let cancelled = false;
-  const video = { buffered: { length: 0 }, currentTime: 0, playbackRate: 1, pause() {}, load() {}, removeAttribute() {},
-    addEventListener() {}, requestVideoFrameCallback(callback) { nextFrame = callback; return 42; },
+  const nodes = {}; const classes = new Set(); const cleanup = []; const videoEvents = {};
+  const video = { buffered: { length: 0 }, currentTime: 0, playbackRate: 1, pause() { cleanup.push("pause"); }, load() { cleanup.push("load"); }, removeAttribute(name) { cleanup.push(name); },
+    addEventListener(name, callback) { videoEvents[name] = callback; }, requestVideoFrameCallback(callback) { nextFrame = callback; return 42; },
     cancelVideoFrameCallback(id) { cancelled = id === 42; } };
   class MediaSource {
     static isTypeSupported() { return true; }
@@ -301,14 +302,25 @@ test("normal socket stop exports pacing through same-request CAF messages and ca
   }
   class WebSocket { constructor() { this.readyState = 1; sockets.push(this); } send(value) { wire.push(JSON.parse(value)); } close() {} }
   const context = { ArrayBuffer, Uint8Array, DataView, TextEncoder, URL: { createObjectURL: () => "blob:test" }, performance: { now: () => 0 }, setTimeout: () => 1, clearTimeout() {}, MediaSource, WebSocket,
-    document: { readyState: "complete", getElementById: (id) => id === "probe-video" ? video : {}, body: { classList: { add() {}, remove() {} } } },
+    document: { readyState: "complete", getElementById: (id) => id === "probe-video" ? video : (nodes[id] ||= {}), body: { classList: { add: (name) => classes.add(name), remove: (name) => classes.delete(name) } } },
     cast: { framework: { CastReceiverContext: { getInstance: () => ({ addCustomMessageListener: (_, callback) => { receiverListener = callback; }, start() {}, sendCustomMessage: (_, sender, message) => messages.push({ sender, ...message }) }) }, CastReceiverOptions: function () {}, system: { MessageType: { JSON: "JSON" } } } } };
   // URL must remain constructible for endpoint validation.
   context.URL = class extends URL { static createObjectURL() { return "blob:test"; } };
   vm.runInNewContext(fs.readFileSync(path.join(__dirname, "..", "receiver.js"), "utf8"), context);
+  assert.equal(nodes["status-title"].textContent, "Ready to Cast");
+  assert.equal(nodes["status-detail"].textContent, "Open the app on your iPhone to begin.");
+  assert.ok(classes.has("receiver-waiting"));
+  assert.equal(nodes["receiver-version"].textContent, `Receiver 2.0.0 · ${context.ScreenMirrorReceiverCapabilityGate.receiverRevision}`);
   sources[0].listeners.sourceopen(); await new Promise(setImmediate);
   receiverListener({ senderId: "sender", data: { type: "startMedia", protocolVersion: 2, requestId: "session_request", endpoint: "ws://192.168.1.1:1234/" + "a".repeat(64) } });
   await new Promise(setImmediate); sources[1].listeners.sourceopen(); sockets[0].onopen();
+  assert.equal(nodes["status-title"].textContent, "Reconnecting…");
+  assert.equal(nodes["status-detail"].textContent, "Keep the app open on your iPhone.");
+  videoEvents.playing(); assert.equal(nodes["idle-screen"].hidden, true);
+  assert.equal(classes.has("receiver-waiting"), false);
+  videoEvents.waiting(); assert.equal(nodes["idle-screen"].hidden, false);
+  assert.ok(classes.has("receiver-waiting"));
+  videoEvents.playing();
   // A minimal valid moof/traf/mdat fixture, envelope sequence distinct from control sequence.
   const box = (name, payload) => { const result = Buffer.alloc(8 + payload.length); result.writeUInt32BE(result.length); result.write(name, 4); payload.copy(result, 8); return result; };
   const mfhd = Buffer.alloc(8); mfhd.writeUInt32BE(71, 4);
@@ -321,7 +333,20 @@ test("normal socket stop exports pacing through same-request CAF messages and ca
   sockets[0].onmessage({ data: binary }); buffers[1].listeners.updateend();
   nextFrame(10, { mediaTime: 0, presentedFrames: 1 });
   sockets[0].onmessage({ data: JSON.stringify({ type: "frameCorrelation", generation: 1, sequence: 9, mediaTimeMs: 0 }) }); nextFrame(30, { mediaTime: 0.02, presentedFrames: 2 });
-  sockets[0].onclose(); sockets[0].onclose();
+  if (ending === "error") sockets[0].onerror();
+  const closeEvent = { code: ending === "abnormal" ? 1006 : 1000, wasClean: ending !== "abnormal" };
+  sockets[0].onclose(closeEvent); sockets[0].onclose(closeEvent);
+  assert.deepEqual(cleanup, ["pause", "src", "load"]);
+  assert.equal(classes.has("media-active"), false);
+  assert.equal(classes.has("receiver-waiting"), false);
+  assert.equal(nodes["idle-screen"].hidden, false);
+  assert.equal(nodes["status-title"].textContent, ending === "normal" ? "Casting Stopped" : "Connection Lost");
+  assert.equal(nodes["status-detail"].textContent, ending === "normal" ? "Ready when you are. Start casting again from your iPhone." : "We’re waiting for your iPhone. Check Wi‑Fi and start casting again.");
+  assert.equal(messages.filter((value) => value.result === "receiver_idle_screen_shown").length, 1);
+  assert.equal(messages.filter((value) => value.result === "receiver_connection_lost_screen_shown").length, ending === "normal" ? 0 : 1);
+  videoEvents.playing(); videoEvents.waiting(); videoEvents.stalled();
+  assert.equal(nodes["idle-screen"].hidden, false);
+  assert.equal(classes.has("receiver-waiting"), false);
   const summary = messages.filter((value) => value.result && value.result.startsWith("frame_pacing_summary_"));
   assert.equal(summary.length, 3); assert.ok(cancelled);
   assert.deepEqual(wire.filter((value) => value.type === "latencyStage").map((value) => value.stage), ["received", "append_started", "append_ended"]);
@@ -359,4 +384,25 @@ test("ordered fallback waits for older unresolved append instead of consuming a 
   assert.equal(frames.length, 0);
   tracker.control({ generation: 1, sequence: 10, mediaTimeMs: 100000 }, 8);
   assert.equal(frames.length, 1); assert.equal(frames[0][2].sequence, 10);
+});
+
+
+test("only a clean normal close is presented as stopped", () => {
+  const gate = receiver();
+  assert.equal(gate.closeScreen({ code: 1000, wasClean: true }, false), "stopped");
+  for (const event of [undefined, { code: 1006, wasClean: false }, { code: 1001, wasClean: true }, { code: 1000, wasClean: false }]) {
+    assert.equal(gate.closeScreen(event, false), "lost");
+  }
+  assert.equal(gate.closeScreen({ code: 1000, wasClean: true }, true), "lost");
+});
+
+test("TV markup contains no developer panel and pins both presentation assets", () => {
+  const html = fs.readFileSync(path.join(__dirname, "..", "receiver.html"), "utf8");
+  const css = fs.readFileSync(path.join(__dirname, "..", "styles.css"), "utf8");
+  assert.doesNotMatch(html, /<dl>|id="last-event"|id="connection-state"|capability gate|scope-note/i);
+  assert.ok(html.includes(`receiver.js?rev=${receiver().receiverRevision}`));
+  assert.ok(html.includes(`styles.css?rev=${receiver().receiverRevision}`));
+  assert.match(html, /aria-atomic="true"/);
+  assert.match(css, /prefers-reduced-motion: reduce/);
+  assert.match(css, /receiver-status\[hidden\]/);
 });

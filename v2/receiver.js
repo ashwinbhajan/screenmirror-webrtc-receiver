@@ -28,11 +28,22 @@
 
   function byteLength(value) { return new TextEncoder().encode(value).length; }
   function safeObject(value) { return value !== null && typeof value === "object" && !Array.isArray(value); }
-  function update(state, detail) {
+  const SCREEN_COPY = Object.freeze({
+    ready: Object.freeze(["Ready to Cast", "Open the app on your iPhone to begin."]),
+    stopped: Object.freeze(["Casting Stopped", "Ready when you are. Start casting again from your iPhone."]),
+    lost: Object.freeze(["Connection Lost", "We’re waiting for your iPhone. Check Wi‑Fi and start casting again."]),
+    reconnecting: Object.freeze(["Reconnecting…", "Keep the app open on your iPhone."])
+  });
+  function showScreen(state) {
     if (!ui) return;
-    ui.state.textContent = state;
-    ui.event.textContent = detail;
-    ui.detail.textContent = detail;
+    const copy = SCREEN_COPY[state];
+    ui.panel.hidden = state === "playing";
+    document.body.classList.remove("receiver-waiting");
+    if (state === "ready" || state === "reconnecting") document.body.classList.add("receiver-waiting");
+    if (copy) { ui.title.textContent = copy[0]; ui.detail.textContent = copy[1]; }
+  }
+  function closeScreen(event, failed) {
+    return !failed && event && event.code === 1000 && event.wasClean === true ? "stopped" : "lost";
   }
   function parse(data) {
     try {
@@ -237,7 +248,7 @@
   }
   function probeWebSocket(event) {
     const request = validateProbe(event.data);
-    if (!event || !event.senderId || !request) { update("Rejected", "Invalid capability probe command"); return; }
+    if (!event || !event.senderId || !request) { return; }
     capabilityReadyPromise.then(() => runWebSocketProbe(event.senderId, request));
   }
   function validateMediaStart(data) {
@@ -266,7 +277,7 @@
     const video = document.getElementById("probe-video");
     document.body.classList.add("media-active");
     document.body.classList.remove("receiver-idle");
-    update("Media", "Waiting for the first decodable video frame");
+    showScreen("reconnecting");
     sendMediaResult(event.senderId, request.requestId, `receiver_revision_reported_${RECEIVER_REVISION}`);
     const pending = []; const maxPending = 8;
     const flowGeneration = 1; const initialCredits = 8; let mediaReadySent = false;
@@ -310,7 +321,7 @@
     const clearInitAppendTimeout = () => { if (initAppendTimeout) { global.clearTimeout(initAppendTimeout); initAppendTimeout = undefined; } };
     const clearPlayTimeout = () => { if (playTimeout) { global.clearTimeout(playTimeout); playTimeout = undefined; } };
     const clearRecoveryTimeout = () => { if (lastPlayback.recoveryTimeout) { global.clearTimeout(lastPlayback.recoveryTimeout); lastPlayback.recoveryTimeout = undefined; } };
-    const clearVideoForReceiverStop = () => {
+    const clearVideoForReceiverStop = (screen) => {
       if (receiverStopped) return;
       receiverStopped = true;
       correlations.finish(performance.now());
@@ -321,9 +332,10 @@
       try { video.pause(); video.removeAttribute("src"); video.load(); } catch (_) {}
       document.body.classList.remove("media-active");
       document.body.classList.add("receiver-idle");
-      update("Stopped", "Screen broadcast ended");
+      showScreen(screen);
       sendMediaResult(event.senderId, request.requestId, "receiver_video_cleared");
       sendMediaResult(event.senderId, request.requestId, "receiver_idle_screen_shown");
+      if (screen === "lost") sendMediaResult(event.senderId, request.requestId, "receiver_connection_lost_screen_shown");
     };
     const stop = (result) => { clearInitAppendTimeout(); clearPlayTimeout(); try { socket && socket.close(); } catch (_) {} sendMediaResult(event.senderId, request.requestId, result); };
     const safePlayRejection = (error) => {
@@ -533,9 +545,10 @@
             }
             stop("binary_envelope_invalid");
           };
-          socket.onerror = () => stop("websocket_failed"); socket.onclose = () => {
+          let socketFailed = false;
+          socket.onerror = () => { socketFailed = true; stop("websocket_failed"); }; socket.onclose = (closeEvent) => {
             sendMediaResult(event.senderId, request.requestId, "receiver_stop_received");
-            clearVideoForReceiverStop();
+            clearVideoForReceiverStop(closeScreen(closeEvent, socketFailed));
             if (!firstRendered) sendMediaResult(event.senderId, request.requestId, "websocket_closed");
           };
           sendMediaResult(event.senderId, request.requestId, "media_socket_connecting");
@@ -548,8 +561,14 @@
       video.addEventListener("loadeddata", () => sendMediaResult(event.senderId, request.requestId, "media_event_loadeddata"));
       video.addEventListener("canplay", () => sendMediaResult(event.senderId, request.requestId, "media_event_canplay"));
       video.addEventListener("canplaythrough", () => sendMediaResult(event.senderId, request.requestId, "media_event_canplaythrough"));
-      video.addEventListener("waiting", () => sendMediaResult(event.senderId, request.requestId, "media_event_waiting"));
-      video.addEventListener("stalled", () => sendMediaResult(event.senderId, request.requestId, "media_event_stalled"));
+      video.addEventListener("waiting", () => {
+        if (!receiverStopped) showScreen("reconnecting");
+        sendMediaResult(event.senderId, request.requestId, "media_event_waiting");
+      });
+      video.addEventListener("stalled", () => {
+        if (!receiverStopped) showScreen("reconnecting");
+        sendMediaResult(event.senderId, request.requestId, "media_event_stalled");
+      });
       video.addEventListener("seeking", () => sendMediaResult(event.senderId, request.requestId, recoverySeekPending ? "recovery_seek_started" : "initial_seek_started"));
       video.addEventListener("seeked", () => {
         if (recoverySeekPending) {
@@ -565,6 +584,7 @@
         attemptPlay();
       });
       video.addEventListener("playing", () => {
+        if (!receiverStopped) showScreen("playing");
         sendMediaResult(event.senderId, request.requestId, "media_event_playing");
       });
       video.addEventListener("timeupdate", () => {
@@ -619,10 +639,10 @@
   function receiverMessage(event) {
     const probe = event && validateProbe(event.data); if (probe) { capabilityReadyPromise.then(() => runWebSocketProbe(event.senderId, probe)); return; }
     const media = event && validateMediaStart(event.data); if (media) { capabilityReadyPromise.then(() => runMedia(event, media)); return; }
-    update("Rejected", "Invalid v2 command");
+    // Unrecognized commands have no user-facing presentation.
   }
   function runWebSocketProbe(senderId, request) {
-    if (!capabilityResult()) { send(senderId, request.requestId, RESULT.FAILED); update("Unsupported", RESULT.FAILED); return; }
+    if (!capabilityResult()) { send(senderId, request.requestId, RESULT.FAILED); return; }
     let socket;
     let finished = false;
     let timeoutRef = { id: null };
@@ -633,7 +653,7 @@
       try { socket && socket.close(); } catch (_) {}
       capabilities = Object.freeze({ ...capabilities, probeAckStatus, terminalStatus });
       send(senderId, request.requestId, result);
-      update(result === RESULT.PASS ? "Passed" : "Stopped", result);
+      // Probe completion does not overwrite the casting screen.
     };
     let opened = false;
     try {
@@ -699,23 +719,25 @@
     });
     return sourceBufferReady.then((sourceBuffer) => {
       capabilities = Object.freeze({ ...result, sourceBuffer });
-      update(capabilityResult() ? "Ready" : "Unsupported", "Autoplay deferred until decodable media");
+
       return capabilities;
     });
   }
   function boot() {
-    ui = { state: document.getElementById("connection-state"), event: document.getElementById("last-event"), detail: document.getElementById("status-detail"), version: document.getElementById("receiver-version") };
-    ui.version.textContent = RECEIVER_VERSION;
+    ui = { panel: document.getElementById("idle-screen"), title: document.getElementById("status-title"), detail: document.getElementById("status-detail"), version: document.getElementById("receiver-version") };
+    // This isolated /v2 entry point is exclusively the Debug receiver.
+    ui.version.textContent = `Receiver ${RECEIVER_VERSION} · ${RECEIVER_REVISION}`;
+    showScreen("ready");
     const video = document.getElementById("probe-video");
     capabilityReadyPromise = testCapabilities(video);
-    if (!global.cast || !global.cast.framework) { update("Error", "CAF unavailable"); return; }
+    if (!global.cast || !global.cast.framework) { showScreen("lost"); return; }
     context = global.cast.framework.CastReceiverContext.getInstance();
     context.addCustomMessageListener(NAMESPACE, receiverMessage);
     const options = new global.cast.framework.CastReceiverOptions();
     options.customNamespaces = { [NAMESPACE]: global.cast.framework.system.MessageType.JSON };
     context.start(options);
-    update("Checking", "Testing receiver capabilities before one endpoint probe");
+
   }
-  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, makeLatencyStage, canConfirmFirstRendered, renderedCorrelationStrategy, createMediaCreditEmitter, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }) });
+  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ SCREEN_COPY, closeScreen, MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, makeLatencyStage, canConfirmFirstRendered, renderedCorrelationStrategy, createMediaCreditEmitter, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }) });
   if (typeof document !== "undefined") document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", boot, { once: true }) : boot();
 })(globalThis);
