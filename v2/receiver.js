@@ -2,7 +2,7 @@
   "use strict";
 
   const RECEIVER_VERSION = "2.0.0";
-  const RECEIVER_REVISION = "corr-fragseq-20260919";
+  const RECEIVER_REVISION = "corr-fragseq-20260919-idlefix";
   const PROTOCOL_VERSION = 2;
   const NAMESPACE = "urn:x-cast:com.ashwinbhajan.screenmirror.cmafprobe.v2";
   const MIME_TYPE = 'video/mp4; codecs="avc1.42e01f"';
@@ -277,7 +277,6 @@
     const video = document.getElementById("probe-video");
     document.body.classList.add("media-active");
     document.body.classList.remove("receiver-idle");
-    showScreen("reconnecting");
     sendMediaResult(event.senderId, request.requestId, `receiver_revision_reported_${RECEIVER_REVISION}`);
     const pending = []; const maxPending = 8;
     const flowGeneration = 1; const initialCredits = 8; let mediaReadySent = false;
@@ -562,11 +561,11 @@
       video.addEventListener("canplay", () => sendMediaResult(event.senderId, request.requestId, "media_event_canplay"));
       video.addEventListener("canplaythrough", () => sendMediaResult(event.senderId, request.requestId, "media_event_canplaythrough"));
       video.addEventListener("waiting", () => {
-        if (!receiverStopped) showScreen("reconnecting");
+        if (!receiverStopped && firstRendered) showScreen("reconnecting");
         sendMediaResult(event.senderId, request.requestId, "media_event_waiting");
       });
       video.addEventListener("stalled", () => {
-        if (!receiverStopped) showScreen("reconnecting");
+        if (!receiverStopped && firstRendered) showScreen("reconnecting");
         sendMediaResult(event.senderId, request.requestId, "media_event_stalled");
       });
       video.addEventListener("seeking", () => sendMediaResult(event.senderId, request.requestId, recoverySeekPending ? "recovery_seek_started" : "initial_seek_started"));

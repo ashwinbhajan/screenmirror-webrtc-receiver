@@ -61,7 +61,7 @@ test("does not change credit emission while adding playback recovery helpers", (
 
 test("declares bounded receiver-stop cleanup diagnostics", () => {
   const gate = receiver();
-  assert.equal(gate.receiverRevision, "corr-fragseq-20260919");
+  assert.equal(gate.receiverRevision, "corr-fragseq-20260919-idlefix");
   assert.deepEqual(JSON.parse(JSON.stringify(gate.receiverStopDiagnostics)), ["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown"]);
 });
 
@@ -314,13 +314,12 @@ for (const ending of ["normal", "abnormal", "error"]) test(`${ending} socket clo
   sources[0].listeners.sourceopen(); await new Promise(setImmediate);
   receiverListener({ senderId: "sender", data: { type: "startMedia", protocolVersion: 2, requestId: "session_request", endpoint: "ws://192.168.1.1:1234/" + "a".repeat(64) } });
   await new Promise(setImmediate); sources[1].listeners.sourceopen(); sockets[0].onopen();
-  assert.equal(nodes["status-title"].textContent, "Reconnecting…");
-  assert.equal(nodes["status-detail"].textContent, "Keep the app open on your iPhone.");
+  assert.equal(nodes["status-title"].textContent, "Ready to Cast");
+  assert.equal(nodes["status-detail"].textContent, "Open the app on your iPhone to begin.");
+  videoEvents.waiting();
+  assert.equal(nodes["status-title"].textContent, "Ready to Cast");
   videoEvents.playing(); assert.equal(nodes["idle-screen"].hidden, true);
   assert.equal(classes.has("receiver-waiting"), false);
-  videoEvents.waiting(); assert.equal(nodes["idle-screen"].hidden, false);
-  assert.ok(classes.has("receiver-waiting"));
-  videoEvents.playing();
   // A minimal valid moof/traf/mdat fixture, envelope sequence distinct from control sequence.
   const box = (name, payload) => { const result = Buffer.alloc(8 + payload.length); result.writeUInt32BE(result.length); result.write(name, 4); payload.copy(result, 8); return result; };
   const mfhd = Buffer.alloc(8); mfhd.writeUInt32BE(71, 4);
@@ -332,6 +331,12 @@ for (const ending of ["normal", "abnormal", "error"]) test(`${ending} socket clo
   const binary = Uint8Array.from(Buffer.concat([header, payload])).buffer;
   sockets[0].onmessage({ data: binary }); buffers[1].listeners.updateend();
   nextFrame(10, { mediaTime: 0, presentedFrames: 1 });
+  videoEvents.waiting();
+  assert.equal(nodes["status-title"].textContent, "Reconnecting…");
+  assert.equal(nodes["status-detail"].textContent, "Keep the app open on your iPhone.");
+  assert.equal(nodes["idle-screen"].hidden, false);
+  assert.ok(classes.has("receiver-waiting"));
+  videoEvents.playing();
   sockets[0].onmessage({ data: JSON.stringify({ type: "frameCorrelation", generation: 1, sequence: 9, mediaTimeMs: 0 }) }); nextFrame(30, { mediaTime: 0.02, presentedFrames: 2 });
   if (ending === "error") sockets[0].onerror();
   const closeEvent = { code: ending === "abnormal" ? 1006 : 1000, wasClean: ending !== "abnormal" };
