@@ -2,7 +2,7 @@
   "use strict";
 
   const RECEIVER_VERSION = "2.0.0";
-  const RECEIVER_REVISION = "corr-fragseq-20260919-normalstop";
+  const RECEIVER_REVISION = "corr-fragseq-20260919-normalstop2";
   const PROTOCOL_VERSION = 2;
   const NAMESPACE = "urn:x-cast:com.ashwinbhajan.screenmirror.cmafprobe.v2";
   const MIME_TYPE = 'video/mp4; codecs="avc1.42e01f"';
@@ -281,6 +281,7 @@
     const pending = []; const maxPending = 8;
     const flowGeneration = 1; const initialCredits = 8; let mediaReadySent = false;
     let source; let buffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let lastAppendingFragment = null; let firstRendered = false; let playAttempted = false; let initialSeekRequested = false; let initialSeekCompleted = false; let recoverySeekPending = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let playTimeout; let receiverStopped = false; let stallThresholdMs = 1500; let recoveryTailSeconds = 0.05; let recoveryMinimumLeadSeconds = 0.05; let recoveryTimeoutMs = 3000; let lastPlayback = { time: 0, advancedAt: performance.now(), recoveryAwaitingProgress: false, recoveryTimeout: undefined };
+    let reconnectingScreenTimer;
     let latencyFallback = false; let frameCallbackID;
     // Preserve the existing timeupdate fallback on receivers without rVFC.
     const latencyCorrelations = new Map();
@@ -320,6 +321,14 @@
     const clearInitAppendTimeout = () => { if (initAppendTimeout) { global.clearTimeout(initAppendTimeout); initAppendTimeout = undefined; } };
     const clearPlayTimeout = () => { if (playTimeout) { global.clearTimeout(playTimeout); playTimeout = undefined; } };
     const clearRecoveryTimeout = () => { if (lastPlayback.recoveryTimeout) { global.clearTimeout(lastPlayback.recoveryTimeout); lastPlayback.recoveryTimeout = undefined; } };
+    const clearReconnectingScreenTimer = () => { if (reconnectingScreenTimer) { global.clearTimeout(reconnectingScreenTimer); reconnectingScreenTimer = undefined; } };
+    const scheduleReconnectingScreen = () => {
+      if (receiverStopped || !firstRendered || reconnectingScreenTimer) return;
+      reconnectingScreenTimer = global.setTimeout(() => {
+        reconnectingScreenTimer = undefined;
+        if (!receiverStopped && firstRendered) showScreen("reconnecting");
+      }, 350);
+    };
     const clearVideoForReceiverStop = (screen) => {
       if (receiverStopped) return;
       receiverStopped = true;
@@ -327,6 +336,7 @@
       pacing.stop(correlations.snapshot().counts);
       if (frameCallbackID !== undefined && typeof video.cancelVideoFrameCallback === "function") video.cancelVideoFrameCallback(frameCallbackID);
       clearRecoveryTimeout();
+      clearReconnectingScreenTimer();
       pending.length = 0;
       try { video.pause(); video.removeAttribute("src"); video.load(); } catch (_) {}
       document.body.classList.remove("media-active");
@@ -570,11 +580,11 @@
       video.addEventListener("canplay", () => sendMediaResult(event.senderId, request.requestId, "media_event_canplay"));
       video.addEventListener("canplaythrough", () => sendMediaResult(event.senderId, request.requestId, "media_event_canplaythrough"));
       video.addEventListener("waiting", () => {
-        if (!receiverStopped && firstRendered) showScreen("reconnecting");
+        scheduleReconnectingScreen();
         sendMediaResult(event.senderId, request.requestId, "media_event_waiting");
       });
       video.addEventListener("stalled", () => {
-        if (!receiverStopped && firstRendered) showScreen("reconnecting");
+        scheduleReconnectingScreen();
         sendMediaResult(event.senderId, request.requestId, "media_event_stalled");
       });
       video.addEventListener("seeking", () => sendMediaResult(event.senderId, request.requestId, recoverySeekPending ? "recovery_seek_started" : "initial_seek_started"));
@@ -592,7 +602,8 @@
         attemptPlay();
       });
       video.addEventListener("playing", () => {
-        if (!receiverStopped) showScreen("playing");
+        clearReconnectingScreenTimer();
+        if (!receiverStopped && !ui.panel.hidden) showScreen("playing");
         sendMediaResult(event.senderId, request.requestId, "media_event_playing");
       });
       video.addEventListener("timeupdate", () => {

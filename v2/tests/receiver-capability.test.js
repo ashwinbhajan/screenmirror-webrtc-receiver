@@ -61,7 +61,7 @@ test("does not change credit emission while adding playback recovery helpers", (
 
 test("declares bounded receiver-stop cleanup diagnostics", () => {
   const gate = receiver();
-  assert.equal(gate.receiverRevision, "corr-fragseq-20260919-normalstop");
+  assert.equal(gate.receiverRevision, "corr-fragseq-20260919-normalstop2");
   assert.deepEqual(JSON.parse(JSON.stringify(gate.receiverStopDiagnostics)), ["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown"]);
 });
 
@@ -290,7 +290,10 @@ test("pacing histogram covers long sessions with explicit overflow", () => {
 
 for (const ending of ["normal", "normalStop", "abnormal", "error"]) test(`${ending} socket closure clears video, presents safe copy and preserves pacing`, async () => {
   const messages = []; const sources = []; const sockets = []; const wire = []; const buffers = []; let receiverListener; let nextFrame; let cancelled = false;
-  const nodes = {}; const classes = new Set(); const cleanup = []; const closes = []; const videoEvents = {};
+  const nodes = {}; const classes = new Set(); const cleanup = []; const closes = []; const videoEvents = {}; const timers = [];
+  const schedule = (callback) => { timers.push(callback); return timers.length; };
+  const cancel = (id) => { timers[id - 1] = null; };
+  const runPendingTimer = () => { const index = timers.findLastIndex(Boolean); const callback = timers[index]; timers[index] = null; callback(); };
   const video = { buffered: { length: 0 }, currentTime: 0, playbackRate: 1, pause() { cleanup.push("pause"); }, load() { cleanup.push("load"); }, removeAttribute(name) { cleanup.push(name); },
     addEventListener(name, callback) { videoEvents[name] = callback; }, requestVideoFrameCallback(callback) { nextFrame = callback; return 42; },
     cancelVideoFrameCallback(id) { cancelled = id === 42; } };
@@ -301,7 +304,7 @@ for (const ending of ["normal", "normalStop", "abnormal", "error"]) test(`${endi
     addSourceBuffer() { const buffer = { listeners: {}, addEventListener(name, callback) { this.listeners[name] = callback; }, appendBuffer() {} }; buffers.push(buffer); return buffer; }
   }
   class WebSocket { constructor() { this.readyState = 1; sockets.push(this); } send(value) { wire.push(JSON.parse(value)); } close(code, reason) { closes.push({ code, reason }); } }
-  const context = { ArrayBuffer, Uint8Array, DataView, TextEncoder, URL: { createObjectURL: () => "blob:test" }, performance: { now: () => 0 }, setTimeout: () => 1, clearTimeout() {}, MediaSource, WebSocket,
+  const context = { ArrayBuffer, Uint8Array, DataView, TextEncoder, URL: { createObjectURL: () => "blob:test" }, performance: { now: () => 0 }, setTimeout: schedule, clearTimeout: cancel, MediaSource, WebSocket,
     document: { readyState: "complete", getElementById: (id) => id === "probe-video" ? video : (nodes[id] ||= {}), body: { classList: { add: (name) => classes.add(name), remove: (name) => classes.delete(name) } } },
     cast: { framework: { CastReceiverContext: { getInstance: () => ({ addCustomMessageListener: (_, callback) => { receiverListener = callback; }, start() {}, sendCustomMessage: (_, sender, message) => messages.push({ sender, ...message }) }) }, CastReceiverOptions: function () {}, system: { MessageType: { JSON: "JSON" } } } } };
   // URL must remain constructible for endpoint validation.
@@ -332,6 +335,8 @@ for (const ending of ["normal", "normalStop", "abnormal", "error"]) test(`${endi
   sockets[0].onmessage({ data: binary }); buffers[1].listeners.updateend();
   nextFrame(10, { mediaTime: 0, presentedFrames: 1 });
   videoEvents.waiting();
+  assert.equal(nodes["status-title"].textContent, "Ready to Cast");
+  runPendingTimer();
   assert.equal(nodes["status-title"].textContent, "Reconnecting…");
   assert.equal(nodes["status-detail"].textContent, "Keep the app open on your iPhone.");
   assert.equal(nodes["idle-screen"].hidden, false);
