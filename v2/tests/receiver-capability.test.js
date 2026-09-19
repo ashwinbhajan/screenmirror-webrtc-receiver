@@ -61,7 +61,7 @@ test("does not change credit emission while adding playback recovery helpers", (
 
 test("declares bounded receiver-stop cleanup diagnostics", () => {
   const gate = receiver();
-  assert.equal(gate.receiverRevision, "corr-fragseq-20260919-normalstop2-icon");
+  assert.equal(gate.receiverRevision, "corr-fragseq-20260919-compat");
   assert.deepEqual(JSON.parse(JSON.stringify(gate.receiverStopDiagnostics)), ["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown"]);
 });
 
@@ -419,6 +419,9 @@ test("TV markup contains no developer panel and pins both presentation assets", 
   assert.ok(html.includes(`receiver.js?rev=${receiver().receiverRevision}`));
   assert.ok(html.includes(`styles.css?rev=${receiver().receiverRevision}`));
   assert.match(html, /assets\/cast-device-icon\.png/);
+  assert.match(html, /casting-fallback/);
+  assert.match(css, /system-ui/);
+  assert.ok(fs.statSync(path.join(__dirname, "..", "assets", "cast-device-icon.png")).size <= 256 * 1024);
   assert.match(html, /aria-atomic="true"/);
   assert.match(css, /prefers-reduced-motion: reduce/);
   assert.match(css, /receiver-status\[hidden\]/);
