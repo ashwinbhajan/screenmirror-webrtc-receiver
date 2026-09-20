@@ -266,6 +266,10 @@
   }
   function sendMediaResult(senderId, requestId, result, telemetry) {
     const payload = { type: "mediaResult", protocolVersion: PROTOCOL_VERSION, requestId, receiverVersion: RECEIVER_VERSION, result };
+    if (["receiver_first_message_received", "receiver_auth_validation_passed", "receiver_media_ready_received"].includes(result)
+        || result.startsWith("first_frame_callback_presented_") || result.startsWith("first_fragment_seq_")) {
+      payload.receiverUptimeMs = performance.now();
+    }
     if (telemetry) payload.telemetry = telemetry;
     context.sendCustomMessage(NAMESPACE, senderId, payload);
   }
@@ -278,12 +282,33 @@
       send(credit);
     };
   }
+  // Diagnostic fingerprint only. Includes actual startup/playback code and closed-over
+  // settings plus receiver capabilities; never includes request IDs, endpoints or tokens.
+  // FNV-1a is a comparison checksum, not a security hash.
+  function effectiveReceiverConfigHash(runtime) {
+    const value = JSON.stringify({ schema: 1, revision: RECEIVER_REVISION,
+      protocolVersion: PROTOCOL_VERSION, namespace: NAMESPACE, mime: MIME_TYPE,
+      maxMessageBytes: MAX_MESSAGE_BYTES, retainedHistorySeconds: RETAINED_HISTORY_SECONDS,
+      trimHistoryThresholdSeconds: TRIM_HISTORY_THRESHOLD_SECONDS,
+      fastThresholdSeconds: LIVE_EDGE_FAST_THRESHOLD_SECONDS,
+      normalThresholdSeconds: LIVE_EDGE_NORMAL_THRESHOLD_SECONDS,
+      fastPlaybackRate: LIVE_EDGE_FAST_PLAYBACK_RATE,
+      implementation: [runMedia, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate].map(String),
+      runtime: { frameCallback: !!runtime.frameCallback, mediaSource: !!runtime.mediaSource,
+        avcMIME: !!runtime.avcMIME, sourceBuffer: !!runtime.sourceBuffer, autoplay: runtime.autoplay } });
+    let hash = 2166136261;
+    for (const byte of new TextEncoder().encode(value)) hash = Math.imul(hash ^ byte, 16777619) >>> 0;
+    return `fnv1a32_${hash.toString(16).padStart(8, "0")}`;
+  }
   function runMedia(event, request) {
     if (!capabilityResult()) { sendMediaResult(event.senderId, request.requestId, "unsupported"); return; }
     const video = document.getElementById("probe-video");
     document.body.classList.add("media-active");
     document.body.classList.remove("receiver-idle");
     sendMediaResult(event.senderId, request.requestId, `receiver_revision_reported_${RECEIVER_REVISION}`);
+    try { sendMediaResult(event.senderId, request.requestId, `effective_receiver_config_hash_${effectiveReceiverConfigHash({
+      ...capabilities, frameCallback: typeof video.requestVideoFrameCallback === "function"
+    })}`); } catch (_) { /* Diagnostics never gate media startup. */ }
     const pending = []; const maxPending = 8;
     const flowGeneration = 1; const initialCredits = 8; let mediaReadySent = false;
     let source; let buffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let lastAppendingFragment = null; let firstRendered = false; let playAttempted = false; let initialSeekRequested = false; let initialSeekCompleted = false; let recoverySeekPending = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let playTimeout; let receiverStopped = false; let stallThresholdMs = 1500; let recoveryTailSeconds = 0.05; let recoveryMinimumLeadSeconds = 0.05; let recoveryTimeoutMs = 3000; let lastPlayback = { time: 0, advancedAt: performance.now(), recoveryAwaitingProgress: false, recoveryTimeout: undefined };
@@ -494,7 +519,9 @@
               initAppendPending = false;
               clearInitAppendTimeout();
               sendMediaResult(event.senderId, request.requestId, "init_append_updateend");
-              if (!mediaReadySent) { mediaReadySent = true; sendLatency({ type: "mediaReady", protocolVersion: PROTOCOL_VERSION, generation: flowGeneration, initialCredits }); }
+              if (!mediaReadySent) { mediaReadySent = true;
+                try { sendMediaResult(event.senderId, request.requestId, "receiver_media_ready_received"); } catch (_) {}
+                sendLatency({ type: "mediaReady", protocolVersion: PROTOCOL_VERSION, generation: flowGeneration, initialCredits }); }
             }
             if (lastAppendingType === 2) firstMediaAppended = true;
             if (lastAppendingType === 2 && mediaAppendPending) {
@@ -534,7 +561,10 @@
           socket.onmessage = (message) => {
             if (typeof message.data === "string") {
               const control = parse(message.data); if (!control) { stop("protocol_error"); return; }
-              if (control.type === "readyForMedia") return;
+              if (control.type === "readyForMedia") {
+                try { sendMediaResult(event.senderId, request.requestId, "receiver_auth_validation_passed"); } catch (_) {}
+                return;
+              }
               if (control.type === "normalStop" && control.protocolVersion === PROTOCOL_VERSION && Object.keys(control).length === 2) {
                 sendMediaResult(event.senderId, request.requestId, "receiver_stop_received");
                 clearVideoForReceiverStop("stopped");
@@ -663,7 +693,10 @@
   }
   function receiverMessage(event) {
     const probe = event && validateProbe(event.data); if (probe) { capabilityReadyPromise.then(() => runWebSocketProbe(event.senderId, probe)); return; }
-    const media = event && validateMediaStart(event.data); if (media) { capabilityReadyPromise.then(() => runMedia(event, media)); return; }
+    const media = event && validateMediaStart(event.data); if (media) {
+      try { sendMediaResult(event.senderId, media.requestId, "receiver_first_message_received"); } catch (_) {}
+      capabilityReadyPromise.then(() => runMedia(event, media)); return;
+    }
     // Unrecognized commands have no user-facing presentation.
   }
   function runWebSocketProbe(senderId, request) {
@@ -763,6 +796,6 @@
     context.start(options);
 
   }
-  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ SCREEN_COPY, closeScreen, MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, makeLatencyStage, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }) });
+  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ effectiveReceiverConfigHash, SCREEN_COPY, closeScreen, MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, makeLatencyStage, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }) });
   if (typeof document !== "undefined") document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", boot, { once: true }) : boot();
 })(globalThis);
