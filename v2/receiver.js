@@ -294,6 +294,10 @@
     if (telemetry) payload.telemetry = telemetry;
     context.sendCustomMessage(NAMESPACE, senderId, payload);
   }
+  function sendReceiverDiagnostic(event, request, result) {
+    if (!event || !event.senderId || !request || typeof request.requestId !== "string") return;
+    sendMediaResult(event.senderId, request.requestId, result);
+  }
   function createMediaCreditEmitter(generation, send) {
     let creditSequence = 0;
     return () => {
@@ -322,7 +326,11 @@
     return `fnv1a32_${hash.toString(16).padStart(8, "0")}`;
   }
   function runMedia(event, request) {
-    if (!capabilityResult()) { sendMediaResult(event.senderId, request.requestId, "unsupported"); return; }
+    if (!capabilityResult()) {
+      sendReceiverDiagnostic(event, request, "receiver_error_before_disconnect_unsupported");
+      sendMediaResult(event.senderId, request.requestId, "unsupported");
+      return;
+    }
     const video = document.getElementById("probe-video");
     document.body.classList.add("media-active");
     document.body.classList.remove("receiver-idle");
@@ -540,9 +548,11 @@
               initAppendPending = false;
               clearInitAppendTimeout();
               sendMediaResult(event.senderId, request.requestId, "init_append_updateend");
-              if (!mediaReadySent) { mediaReadySent = true;
-                try { sendMediaResult(event.senderId, request.requestId, "receiver_media_ready_received"); } catch (_) {}
-                sendLatency({ type: "mediaReady", protocolVersion: PROTOCOL_VERSION, generation: flowGeneration, initialCredits }); }
+              if (!mediaReadySent) {
+                mediaReadySent = true;
+                sendReceiverDiagnostic(event, request, "receiver_media_ready_received");
+                sendLatency({ type: "mediaReady", protocolVersion: PROTOCOL_VERSION, generation: flowGeneration, initialCredits });
+              }
             }
             if (lastAppendingType === 2) firstMediaAppended = true;
             if (lastAppendingType === 2 && mediaAppendPending) {
@@ -578,12 +588,17 @@
             stop("append_aborted");
           });
           socket = new global.WebSocket(request.endpoint); socket.binaryType = "arraybuffer";
-          socket.onopen = () => { socket.send(JSON.stringify({ type: "hello", token: new URL(request.endpoint).pathname.slice(1), protocolVersion: PROTOCOL_VERSION })); installFrameObserver(); };
+          socket.onopen = () => {
+            sendReceiverDiagnostic(event, request, "receiver_endpoint_fetch_started");
+            socket.send(JSON.stringify({ type: "hello", token: new URL(request.endpoint).pathname.slice(1), protocolVersion: PROTOCOL_VERSION }));
+            installFrameObserver();
+          };
           socket.onmessage = (message) => {
             if (typeof message.data === "string") {
               const control = parse(message.data); if (!control) { stop("protocol_error"); return; }
               if (control.type === "readyForMedia") {
-                try { sendMediaResult(event.senderId, request.requestId, "receiver_auth_validation_passed"); } catch (_) {}
+                sendReceiverDiagnostic(event, request, "receiver_auth_validation_passed");
+                sendReceiverDiagnostic(event, request, "receiver_endpoint_fetch_succeeded");
                 return;
               }
               if (control.type === "normalStop" && control.protocolVersion === PROTOCOL_VERSION && Object.keys(control).length === 2) {
@@ -600,6 +615,8 @@
                 }
                 return;
               }
+              sendReceiverDiagnostic(event, request, "receiver_auth_validation_failed");
+              sendReceiverDiagnostic(event, request, "receiver_error_before_disconnect_protocol_error");
               stop("protocol_error"); return;
             }
             const envelope = parseEnvelope(message.data); if (!envelope) { stop("binary_envelope_invalid"); return; }
@@ -619,12 +636,24 @@
             stop("binary_envelope_invalid");
           };
           let socketFailed = false;
-          socket.onerror = () => { socketFailed = true; stop("websocket_failed"); }; socket.onclose = (closeEvent) => {
+          socket.onerror = () => {
+            socketFailed = true;
+            if (!firstRendered) {
+              sendReceiverDiagnostic(event, request, "receiver_endpoint_fetch_failed");
+              sendReceiverDiagnostic(event, request, "receiver_error_before_disconnect_websocket_error");
+            }
+            stop("websocket_failed");
+          }; socket.onclose = (closeEvent) => {
             if (!receiverStopped) {
               sendMediaResult(event.senderId, request.requestId, "receiver_stop_received");
               clearVideoForReceiverStop(closeScreen(closeEvent, socketFailed));
             }
-            if (!firstRendered) sendMediaResult(event.senderId, request.requestId, "websocket_closed");
+            if (!firstRendered) {
+              const code = closeEvent && Number.isInteger(closeEvent.code) ? closeEvent.code : 0;
+              sendReceiverDiagnostic(event, request, "receiver_endpoint_fetch_failed");
+              sendReceiverDiagnostic(event, request, `receiver_error_before_disconnect_websocket_closed_${code}`);
+              sendMediaResult(event.senderId, request.requestId, "websocket_closed");
+            }
           };
           sendMediaResult(event.senderId, request.requestId, "media_socket_connecting");
         } catch (_) { stop("sourcebuffer_failed"); }
@@ -714,10 +743,22 @@
   }
   function receiverMessage(event) {
     const probe = event && validateProbe(event.data); if (probe) { capabilityReadyPromise.then(() => runWebSocketProbe(event.senderId, probe)); return; }
-    const media = event && validateMediaStart(event.data); if (media) {
+    const raw = event && parse(event.data);
+    const canReportMediaValidation = raw && raw.type === "startMedia" && typeof raw.requestId === "string" && REQUEST_ID.test(raw.requestId);
+    if (canReportMediaValidation) {
+      sendReceiverDiagnostic(event, raw, "receiver_namespace_opened");
+      sendReceiverDiagnostic(event, raw, "receiver_first_message_received");
+    }
+    const media = event && validateMediaStart(event.data);
+    if (media) {
       emitReceiverStartup(event, media);
-      try { sendMediaResult(event.senderId, media.requestId, "receiver_first_message_received"); } catch (_) {}
-      capabilityReadyPromise.then(() => runMedia(event, media)); return;
+      sendReceiverDiagnostic(event, media, `receiver_page_loaded_revision_${RECEIVER_REVISION}`);
+      sendReceiverDiagnostic(event, media, "receiver_media_payload_validation_passed");
+      capabilityReadyPromise.then(() => runMedia(event, media));
+      return;
+    }
+    if (canReportMediaValidation) {
+      sendReceiverDiagnostic(event, raw, "receiver_media_payload_validation_failed");
     }
     // Unrecognized commands have no user-facing presentation.
   }
@@ -804,9 +845,7 @@
     });
   }
   function boot() {
-    ui = { panel: document.getElementById("idle-screen"), title: document.getElementById("status-title"), detail: document.getElementById("status-detail"), version: document.getElementById("receiver-version") };
-    // This isolated /v2 entry point is exclusively the Debug receiver.
-    ui.version.textContent = `Receiver ${RECEIVER_VERSION} · ${RECEIVER_REVISION}`;
+    ui = { panel: document.getElementById("idle-screen"), title: document.getElementById("status-title"), detail: document.getElementById("status-detail") };
     showScreen("ready");
     const video = document.getElementById("probe-video");
     capabilityReadyPromise = testCapabilities(video);

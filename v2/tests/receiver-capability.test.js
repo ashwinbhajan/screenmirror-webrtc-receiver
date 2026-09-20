@@ -5,7 +5,7 @@ const test = require("node:test");
 const vm = require("node:vm");
 
 function receiver(consoleOverride = console) {
-  const context = { console: consoleOverride, TextEncoder, URL, setTimeout, clearTimeout, globalThis: null };
+  const context = { console: consoleOverride, TextEncoder, URL, URLSearchParams, setTimeout, clearTimeout, globalThis: null };
   context.globalThis = context;
   vm.runInNewContext(fs.readFileSync(path.join(__dirname, "..", "receiver.js"), "utf8"), context);
   return context.ScreenMirrorReceiverCapabilityGate;
@@ -290,6 +290,7 @@ test("pacing histogram covers long sessions with explicit overflow", () => {
 
 for (const ending of ["normal", "normalStop", "abnormal", "error"]) test(`${ending} socket closure clears video, presents safe copy and preserves pacing`, async () => {
   const messages = []; const sources = []; const sockets = []; const wire = []; const buffers = []; let receiverListener; let nextFrame; let cancelled = false; let now = 0;
+  const systemEvents = {};
   const nodes = {}; const classes = new Set(); const cleanup = []; const closes = []; const videoEvents = {}; const timers = [];
   const schedule = (callback) => { timers.push(callback); return timers.length; };
   const cancel = (id) => { timers[id - 1] = null; };
@@ -306,17 +307,38 @@ for (const ending of ["normal", "normalStop", "abnormal", "error"]) test(`${endi
   class WebSocket { constructor() { this.readyState = 1; sockets.push(this); } send(value) { wire.push(JSON.parse(value)); } close(code, reason) { closes.push({ code, reason }); } }
   const context = { ArrayBuffer, Uint8Array, DataView, TextEncoder, URL: { createObjectURL: () => "blob:test" }, performance: { now: () => now }, setTimeout: schedule, clearTimeout: cancel, MediaSource, WebSocket,
     document: { readyState: "complete", getElementById: (id) => id === "probe-video" ? video : (nodes[id] ||= {}), body: { classList: { add: (name) => classes.add(name), remove: (name) => classes.delete(name) } } },
-    cast: { framework: { CastReceiverContext: { getInstance: () => ({ addCustomMessageListener: (_, callback) => { receiverListener = callback; }, start() {}, sendCustomMessage: (_, sender, message) => messages.push({ sender, ...message }) }) }, CastReceiverOptions: function () {}, system: { MessageType: { JSON: "JSON" } } } } };
+    cast: { framework: { CastReceiverContext: { getInstance: () => ({ addEventListener: (name, callback) => { systemEvents[name] = callback; }, addCustomMessageListener: (_, callback) => { receiverListener = callback; }, start() {}, sendCustomMessage: (_, sender, message) => messages.push({ sender, ...message }) }) }, CastReceiverOptions: function () {}, system: { EventType: { READY: "ready", SENDER_CONNECTED: "sender_connected" }, MessageType: { JSON: "JSON" } } } } };
   // URL must remain constructible for endpoint validation.
   context.URL = class extends URL { static createObjectURL() { return "blob:test"; } };
   vm.runInNewContext(fs.readFileSync(path.join(__dirname, "..", "receiver.js"), "utf8"), context);
   assert.equal(nodes["status-title"].textContent, "Ready to Cast");
   assert.equal(nodes["status-detail"].textContent, "Open the app on your iPhone to begin.");
   assert.ok(classes.has("receiver-waiting"));
-  assert.equal(nodes["receiver-version"].textContent, `Receiver 2.0.0 · ${context.ScreenMirrorReceiverCapabilityGate.receiverRevision}`);
+  now = 4; systemEvents.ready();
+  now = 7; systemEvents.sender_connected({ senderId: "sender" });
+  now = 9; systemEvents.sender_connected({ senderId: "other_sender" });
+  now = 20;
   sources[0].listeners.sourceopen(); await new Promise(setImmediate);
   receiverListener({ senderId: "sender", data: { type: "startMedia", protocolVersion: 2, requestId: "session_request", endpoint: "ws://192.168.1.1:1234/" + "a".repeat(64) } });
   await new Promise(setImmediate); sources[1].listeners.sourceopen(); sockets[0].onopen();
+  sockets[0].onmessage({ data: JSON.stringify({ type: "readyForMedia", protocolVersion: 2 }) });
+  const startupDiagnostics = messages.map((message) => message.result);
+  for (const [name, time] of Object.entries({ receiver_page_script_started: 0, receiver_namespace_registered: 0,
+                                           receiver_caf_context_ready: 4, receiver_sender_connected: 7 })) {
+    const marker = messages.find((message) => message.result === name);
+    assert.ok(marker, `missing ${name}`);
+    assert.equal(marker.receiverUptimeMs, time, "startup timing must retain original time and requesting sender");
+    assert.equal(marker.requestId, "session_request");
+  }
+  for (const result of [
+    `receiver_page_loaded_revision_${context.ScreenMirrorReceiverCapabilityGate.receiverRevision}`,
+    "receiver_namespace_opened",
+    "receiver_first_message_received",
+    "receiver_media_payload_validation_passed",
+    "receiver_endpoint_fetch_started",
+    "receiver_auth_validation_passed",
+    "receiver_endpoint_fetch_succeeded"
+  ]) assert.ok(startupDiagnostics.includes(result), `missing ${result}`);
   assert.equal(nodes["status-title"].textContent, "Ready to Cast");
   assert.equal(nodes["status-detail"].textContent, "Open the app on your iPhone to begin.");
   videoEvents.waiting();
@@ -333,12 +355,12 @@ for (const ending of ["normal", "normalStop", "abnormal", "error"]) test(`${endi
   const header = Buffer.alloc(14); header.write("SMC1"); header[4] = 2; header[5] = 2; header.writeUInt32BE(71, 6); header.writeUInt32BE(payload.length, 10);
   const binary = Uint8Array.from(Buffer.concat([header, payload])).buffer;
   sockets[0].onmessage({ data: binary }); buffers[1].listeners.updateend();
-  nextFrame(10, { mediaTime: 0, presentedFrames: 1 });
+  nextFrame(30, { mediaTime: 0, presentedFrames: 1 });
   videoEvents.waiting();
   assert.equal(nodes["status-title"].textContent, "Ready to Cast");
   runPendingTimer();
   assert.equal(nodes["idle-screen"].hidden, true, "a transient waiting event must not replace visible video");
-  now = 1500;
+  now = 1520;
   videoEvents.waiting();
   runPendingTimer();
   assert.equal(nodes["status-title"].textContent, "Reconnecting…");
@@ -346,7 +368,7 @@ for (const ending of ["normal", "normalStop", "abnormal", "error"]) test(`${endi
   assert.equal(nodes["idle-screen"].hidden, false);
   assert.ok(classes.has("receiver-waiting"));
   videoEvents.playing();
-  sockets[0].onmessage({ data: JSON.stringify({ type: "frameCorrelation", generation: 1, sequence: 9, mediaTimeMs: 0 }) }); nextFrame(30, { mediaTime: 0.02, presentedFrames: 2 });
+  sockets[0].onmessage({ data: JSON.stringify({ type: "frameCorrelation", generation: 1, sequence: 9, mediaTimeMs: 0 }) }); nextFrame(50, { mediaTime: 0.02, presentedFrames: 2 });
   if (ending === "error") sockets[0].onerror();
   if (ending === "normalStop") sockets[0].onmessage({ data: JSON.stringify({ type: "normalStop", protocolVersion: 2 }) });
   const closeEvent = { code: ending === "abnormal" ? 1006 : 1000, wasClean: ending !== "abnormal" };
@@ -371,13 +393,13 @@ for (const ending of ["normal", "normalStop", "abnormal", "error"]) test(`${endi
   assert.equal(summary.length, 3); assert.ok(cancelled);
   assert.deepEqual(wire.filter((value) => value.type === "latencyStage").map((value) => value.stage), ["received", "append_started", "append_ended"]);
   const rendered = wire.filter((value) => value.type === "renderedFrame");
-  assert.equal(rendered.length, 1); assert.equal(rendered[0].sequence, 9); assert.equal(rendered[0].receiverTimeMs, 10);
+  assert.equal(rendered.length, 1); assert.equal(rendered[0].sequence, 9); assert.equal(rendered[0].receiverTimeMs, 30);
   assert.ok(messages.some((value) => value.result === "frame_correlation_late_bound"));
   assert.ok(summary[0].result.includes("count_2"));
   assert.ok(summary[2].result.includes("uncorrelated_no_fragment_match_0"));
   for (const message of summary) { assert.equal(message.requestId, "session_request"); assert.equal(message.sender, "sender"); assert.ok(JSON.stringify(message).length < 1024); }
   assert.ok(messages.findIndex((value) => value.result === "receiver_video_cleared") > messages.indexOf(summary[2]));
-  nextFrame(50, { mediaTime: 0.04, presentedFrames: 3 });
+  nextFrame(70, { mediaTime: 0.04, presentedFrames: 3 });
   assert.equal(messages.filter((value) => value.result && value.result.startsWith("frame_pacing_summary_")).length, 3);
 });
 
@@ -433,8 +455,18 @@ test("TV markup contains no developer panel and pins both presentation assets", 
   assert.ok(html.includes(`assets/cast-device-icon.png?rev=${receiver().receiverRevision}`));
   assert.match(html, /alt="Screen Mirror"/);
   assert.match(css, /system-ui/);
+  assert.doesNotMatch(html, /receiver-version|Receiver 2\.0\.0/);
+  assert.doesNotMatch(css, /receiver-version|receiver-debug-footer/);
   assert.ok(fs.statSync(path.join(__dirname, "..", "assets", "cast-device-icon.png")).size <= 256 * 1024);
   assert.match(html, /aria-atomic="true"/);
   assert.match(css, /prefers-reduced-motion: reduce/);
   assert.match(css, /receiver-status\[hidden\]/);
+});
+
+test("effective config fingerprint is stable, secret-free and distinguishes capabilities", () => {
+  const gate = receiver();
+  const runtime = { frameCallback: true, mediaSource: true, avcMIME: true, sourceBuffer: true, autoplay: "allowed" };
+  assert.match(gate.effectiveReceiverConfigHash(runtime), /^fnv1a32_[0-9a-f]{8}$/);
+  assert.equal(gate.effectiveReceiverConfigHash(runtime), gate.effectiveReceiverConfigHash({ ...runtime, endpoint: "secret", requestId: "another" }));
+  assert.notEqual(gate.effectiveReceiverConfigHash(runtime), gate.effectiveReceiverConfigHash({ ...runtime, frameCallback: false }));
 });
