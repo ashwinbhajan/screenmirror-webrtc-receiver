@@ -21,6 +21,26 @@
     WEBSOCKET_FAILED: "websocket_failed"
   });
 
+  const startupTiming = Object.create(null);
+  const senderConnections = new Map();
+  const receiverNow = () => global.performance && typeof global.performance.now === "function" ? global.performance.now() : null;
+  startupTiming.receiver_page_script_started = Number.isFinite(global.__screenMirrorPageScriptStarted)
+    ? global.__screenMirrorPageScriptStarted : receiverNow();
+  function recordReceiverStartup(name, at = receiverNow()) {
+    if (Number.isFinite(at) && startupTiming[name] === undefined) startupTiming[name] = at;
+  }
+  function emitReceiverStartup(event, request) {
+    for (const name of ["receiver_page_script_started", "receiver_caf_context_ready", "receiver_namespace_registered"]) {
+      if (Number.isFinite(startupTiming[name])) {
+        try { sendMediaResult(event.senderId, request.requestId, name, undefined, startupTiming[name]); } catch (_) {}
+      }
+    }
+    const connectedAt = senderConnections.get(event.senderId);
+    if (Number.isFinite(connectedAt)) {
+      try { sendMediaResult(event.senderId, request.requestId, "receiver_sender_connected", undefined, connectedAt); } catch (_) {}
+    }
+  }
+
   let context;
   let ui;
   let capabilities = Object.freeze({ webSocketAPI: false, mediaSource: false, avcMIME: false, sourceBuffer: false, autoplay: "deferred", websocketAttempted: false, websocketAuthenticated: false, probeAckStatus: "not_attempted", terminalStatus: "capability_partial", websocketLifecycle: "not_attempted" });
@@ -264,12 +284,13 @@
         !REQUEST_ID.test(message.requestId) || typeof message.endpoint !== "string" || !validEndpoint(message.endpoint)) return null;
     return message;
   }
-  function sendMediaResult(senderId, requestId, result, telemetry) {
+  function sendMediaResult(senderId, requestId, result, telemetry, observedReceiverTime) {
     const payload = { type: "mediaResult", protocolVersion: PROTOCOL_VERSION, requestId, receiverVersion: RECEIVER_VERSION, result };
     if (["receiver_first_message_received", "receiver_auth_validation_passed", "receiver_media_ready_received"].includes(result)
         || result.startsWith("first_frame_callback_presented_") || result.startsWith("first_fragment_seq_")) {
       payload.receiverUptimeMs = performance.now();
     }
+    if (Number.isFinite(observedReceiverTime)) payload.receiverUptimeMs = observedReceiverTime;
     if (telemetry) payload.telemetry = telemetry;
     context.sendCustomMessage(NAMESPACE, senderId, payload);
   }
@@ -694,6 +715,7 @@
   function receiverMessage(event) {
     const probe = event && validateProbe(event.data); if (probe) { capabilityReadyPromise.then(() => runWebSocketProbe(event.senderId, probe)); return; }
     const media = event && validateMediaStart(event.data); if (media) {
+      emitReceiverStartup(event, media);
       try { sendMediaResult(event.senderId, media.requestId, "receiver_first_message_received"); } catch (_) {}
       capabilityReadyPromise.then(() => runMedia(event, media)); return;
     }
@@ -790,7 +812,17 @@
     capabilityReadyPromise = testCapabilities(video);
     if (!global.cast || !global.cast.framework) { showScreen("lost"); return; }
     context = global.cast.framework.CastReceiverContext.getInstance();
+    if (typeof context.addEventListener === "function") {
+      const types = global.cast.framework.system.EventType;
+      context.addEventListener(types.READY, () => recordReceiverStartup("receiver_caf_context_ready"));
+      context.addEventListener(types.SENDER_CONNECTED, (event) => {
+        if (!event || typeof event.senderId !== "string") return;
+        if (senderConnections.size >= 4) senderConnections.delete(senderConnections.keys().next().value);
+        senderConnections.set(event.senderId, receiverNow());
+      });
+    }
     context.addCustomMessageListener(NAMESPACE, receiverMessage);
+    recordReceiverStartup("receiver_namespace_registered");
     const options = new global.cast.framework.CastReceiverOptions();
     options.customNamespaces = { [NAMESPACE]: global.cast.framework.system.MessageType.JSON };
     context.start(options);
