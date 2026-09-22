@@ -33,6 +33,18 @@ test("does not expose endpoint data in the safe capability snapshot", () => {
   assert.equal(receiver().snapshot().autoplay, "deferred");
 });
 
+test("emits bounded, privacy-safe capability diagnostic tokens", () => {
+  const results = receiver().capabilityDiagnosticResults();
+  assert.deepEqual(JSON.parse(JSON.stringify(results)), [
+    "receiver_capability_websocket_false_mediasource_false_avcmime_false_sourcebuffer_false",
+    "receiver_capability_probe_protocol_2_mime_avc1_42e01f",
+    "receiver_capability_avcmime_outcome_not_tested_exception_none",
+    "receiver_capability_sourcebuffer_outcome_not_tested_exception_none",
+    "receiver_capability_revision_corr_fragseq_20260922_capability_snapshot"
+  ]);
+  assert.equal(results.join(" ").includes("ws://"), false);
+});
+
 test("uses the explicit mixed-content stop classification", () => {
   assert.equal(receiver().RESULT.MIXED_CONTENT_BLOCKED, "websocket_mixed_content_blocked");
 });
@@ -61,7 +73,7 @@ test("does not change credit emission while adding playback recovery helpers", (
 
 test("declares bounded receiver-stop cleanup diagnostics", () => {
   const gate = receiver();
-  assert.equal(gate.receiverRevision, "corr-fragseq-20260920-presentation");
+  assert.equal(gate.receiverRevision, "corr-fragseq-20260922-capability-snapshot");
   assert.deepEqual(JSON.parse(JSON.stringify(gate.receiverStopDiagnostics)), ["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown"]);
 });
 

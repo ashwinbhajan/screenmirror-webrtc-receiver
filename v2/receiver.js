@@ -2,7 +2,7 @@
   "use strict";
 
   const RECEIVER_VERSION = "2.0.0";
-  const RECEIVER_REVISION = "corr-fragseq-20260920-presentation";
+  const RECEIVER_REVISION = "corr-fragseq-20260922-capability-snapshot";
   const PROTOCOL_VERSION = 2;
   const NAMESPACE = "urn:x-cast:com.ashwinbhajan.screenmirror.cmafprobe.v2";
   const MIME_TYPE = 'video/mp4; codecs="avc1.42e01f"';
@@ -44,6 +44,7 @@
   let context;
   let ui;
   let capabilities = Object.freeze({ webSocketAPI: false, mediaSource: false, avcMIME: false, sourceBuffer: false, autoplay: "deferred", websocketAttempted: false, websocketAuthenticated: false, probeAckStatus: "not_attempted", terminalStatus: "capability_partial", websocketLifecycle: "not_attempted" });
+  let capabilityProbe = Object.freeze({ avcMIMEOutcome: "not_tested", avcMIMEException: "none", sourceBufferOutcome: "not_tested", sourceBufferException: "none" });
   let capabilityReadyPromise = Promise.resolve(capabilities);
 
   function byteLength(value) { return new TextEncoder().encode(value).length; }
@@ -91,6 +92,25 @@
   }
   function capabilityResult() {
     return capabilities.webSocketAPI && capabilities.mediaSource && capabilities.avcMIME && capabilities.sourceBuffer;
+  }
+  function safeException(error) {
+    if (!error) return "none";
+    const name = typeof error.name === "string" ? error.name : "error";
+    const message = typeof error.message === "string" ? error.message : "";
+    return `${name}_${message}`.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "").slice(0, 64) || "error";
+  }
+  function capabilityDiagnosticResults() {
+    const bool = (value) => value ? "true" : "false";
+    return [
+      `receiver_capability_websocket_${bool(capabilities.webSocketAPI)}_mediasource_${bool(capabilities.mediaSource)}_avcmime_${bool(capabilities.avcMIME)}_sourcebuffer_${bool(capabilities.sourceBuffer)}`,
+      "receiver_capability_probe_protocol_2_mime_avc1_42e01f",
+      `receiver_capability_avcmime_outcome_${capabilityProbe.avcMIMEOutcome}_exception_${capabilityProbe.avcMIMEException}`,
+      `receiver_capability_sourcebuffer_outcome_${capabilityProbe.sourceBufferOutcome}_exception_${capabilityProbe.sourceBufferException}`,
+      "receiver_capability_revision_corr_fragseq_20260922_capability_snapshot"
+    ];
+  }
+  function sendCapabilityDiagnostics(event, request) {
+    for (const result of capabilityDiagnosticResults()) sendMediaResult(event.senderId, request.requestId, result);
   }
   function recoverySeekTarget(currentTime, start, end) {
     if (!Number.isFinite(currentTime) || !Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
@@ -326,6 +346,7 @@
     return `fnv1a32_${hash.toString(16).padStart(8, "0")}`;
   }
   function runMedia(event, request) {
+    sendCapabilityDiagnostics(event, request);
     if (!capabilityResult()) {
       sendReceiverDiagnostic(event, request, "receiver_error_before_disconnect_unsupported");
       sendMediaResult(event.senderId, request.requestId, "unsupported");
@@ -825,21 +846,33 @@
   }
   function testCapabilities(video) {
     const result = { webSocketAPI: typeof global.WebSocket === "function", mediaSource: typeof global.MediaSource === "function", avcMIME: false, sourceBuffer: false, autoplay: "deferred", websocketAttempted: false, websocketAuthenticated: false, probeAckStatus: "not_attempted", terminalStatus: "capability_partial", websocketLifecycle: "not_attempted" };
-    result.avcMIME = result.mediaSource && global.MediaSource.isTypeSupported(MIME_TYPE) === true;
+    let avcMIMEException = "none";
+    if (result.mediaSource) {
+      try { result.avcMIME = global.MediaSource.isTypeSupported(MIME_TYPE) === true; }
+      catch (error) { avcMIMEException = safeException(error); }
+    }
     const sourceBufferReady = new Promise((resolve) => {
       if (!result.avcMIME) { resolve(false); return; }
       try {
         const source = new global.MediaSource();
         video.src = global.URL.createObjectURL(source);
-        const timeout = global.setTimeout(() => resolve(false), 1500);
+        const timeout = global.setTimeout(() => resolve({ value: false, exception: "timeout" }), 1500);
         source.addEventListener("sourceopen", () => {
           global.clearTimeout(timeout);
-          try { resolve(!!source.addSourceBuffer(MIME_TYPE)); } catch (_) { resolve(false); }
+          try { resolve({ value: !!source.addSourceBuffer(MIME_TYPE), exception: "none" }); } catch (error) { resolve({ value: false, exception: safeException(error) }); }
         }, { once: true });
-      } catch (_) { resolve(false); }
+      } catch (error) { resolve({ value: false, exception: safeException(error) }); }
     });
-    return sourceBufferReady.then((sourceBuffer) => {
+    return sourceBufferReady.then((sourceBufferProbe) => {
+      const sourceBuffer = typeof sourceBufferProbe === "boolean" ? sourceBufferProbe : sourceBufferProbe.value;
+      const sourceBufferException = typeof sourceBufferProbe === "boolean" ? "none" : sourceBufferProbe.exception;
       capabilities = Object.freeze({ ...result, sourceBuffer });
+      capabilityProbe = Object.freeze({
+        avcMIMEOutcome: result.avcMIME ? "true" : "false",
+        avcMIMEException,
+        sourceBufferOutcome: sourceBuffer ? "true" : "false",
+        sourceBufferException
+      });
 
       return capabilities;
     });
@@ -867,6 +900,6 @@
     context.start(options);
 
   }
-  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ effectiveReceiverConfigHash, SCREEN_COPY, closeScreen, MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, makeLatencyStage, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }) });
+  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ effectiveReceiverConfigHash, SCREEN_COPY, closeScreen, MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, makeLatencyStage, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
   if (typeof document !== "undefined") document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", boot, { once: true }) : boot();
 })(globalThis);
