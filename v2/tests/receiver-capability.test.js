@@ -73,8 +73,8 @@ test("does not change credit emission while adding playback recovery helpers", (
 
 test("declares bounded receiver-stop cleanup diagnostics", () => {
   const gate = receiver();
-  assert.equal(gate.receiverRevision, "corr-fragseq-20260922-capability-snapshot");
-  assert.deepEqual(JSON.parse(JSON.stringify(gate.receiverStopDiagnostics)), ["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown"]);
+  assert.equal(gate.receiverRevision, "corr-fragseq-20260927-namespace-diag-01");
+  assert.deepEqual(JSON.parse(JSON.stringify(gate.receiverStopDiagnostics)), ["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]);
 });
 
 test("retains a bounded GOP history before trimming buffered media", () => {

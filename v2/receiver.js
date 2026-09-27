@@ -2,7 +2,7 @@
   "use strict";
 
   const RECEIVER_VERSION = "2.0.0";
-  const RECEIVER_REVISION = "corr-fragseq-20260922-capability-snapshot";
+  const RECEIVER_REVISION = "corr-fragseq-20260927-namespace-diag-01";
   const PROTOCOL_VERSION = 2;
   const NAMESPACE = "urn:x-cast:com.ashwinbhajan.screenmirror.cmafprobe.v2";
   const MIME_TYPE = 'video/mp4; codecs="avc1.42e01f"';
@@ -23,6 +23,7 @@
 
   const startupTiming = Object.create(null);
   const senderConnections = new Map();
+  let activeReceiverPagehideListener = null;
   const receiverNow = () => global.performance && typeof global.performance.now === "function" ? global.performance.now() : null;
   startupTiming.receiver_page_script_started = Number.isFinite(global.__screenMirrorPageScriptStarted)
     ? global.__screenMirrorPageScriptStarted : receiverNow();
@@ -362,6 +363,18 @@
     const pending = []; const maxPending = 8;
     const flowGeneration = 1; const initialCredits = 8; let mediaReadySent = false;
     let source; let buffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let lastAppendingFragment = null; let firstRendered = false; let playAttempted = false; let initialSeekRequested = false; let initialSeekCompleted = false; let recoverySeekPending = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let playTimeout; let receiverStopped = false; let stallThresholdMs = 1500; let recoveryTailSeconds = 0.05; let recoveryMinimumLeadSeconds = 0.05; let recoveryTimeoutMs = 3000; let lastPlayback = { time: 0, advancedAt: performance.now(), recoveryAwaitingProgress: false, recoveryTimeout: undefined };
+    if (activeReceiverPagehideListener && typeof global.removeEventListener === "function") {
+      global.removeEventListener("pagehide", activeReceiverPagehideListener);
+    }
+    activeReceiverPagehideListener = () => {
+      try {
+        sendMediaResult(event.senderId, request.requestId,
+          receiverStopped ? "receiver_document_pagehide_after_stop" : "receiver_document_pagehide_during_media");
+      } catch (_) { /* Lifecycle diagnostics never affect receiver state. */ }
+    };
+    if (typeof global.addEventListener === "function") {
+      global.addEventListener("pagehide", activeReceiverPagehideListener, { once: true });
+    }
     let reconnectingScreenTimer;
     let latencyFallback = false; let frameCallbackID;
     // Preserve the existing timeupdate fallback on receivers without rVFC.
@@ -900,6 +913,6 @@
     context.start(options);
 
   }
-  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ effectiveReceiverConfigHash, SCREEN_COPY, closeScreen, MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, makeLatencyStage, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
+  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ effectiveReceiverConfigHash, SCREEN_COPY, closeScreen, MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, makeLatencyStage, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
   if (typeof document !== "undefined") document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", boot, { once: true }) : boot();
 })(globalThis);
