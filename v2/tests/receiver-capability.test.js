@@ -49,6 +49,26 @@ test("uses the explicit mixed-content stop classification", () => {
   assert.equal(receiver().RESULT.MIXED_CONTENT_BLOCKED, "websocket_mixed_content_blocked");
 });
 
+test("accepts a bounded readiness query and reports the current revision", () => {
+  const gate = receiver();
+  const query = JSON.stringify({ type: "receiverReadyQuery", protocolVersion: 2, requestId: "ready-1" });
+  assert.deepEqual(JSON.parse(JSON.stringify(gate.validateReadyQuery(query))), { type: "receiverReadyQuery", protocolVersion: 2, requestId: "ready-1" });
+  assert.deepEqual(JSON.parse(JSON.stringify(gate.makeReadyReport("ready-1"))), {
+    type: "receiverReadyReport", protocolVersion: 2, requestId: "ready-1", receiverVersion: "2.0.0",
+    receiverRevision: "corr-fragseq-20261010-ready-handshake-01", receiverState: "ready"
+  });
+});
+
+test("readiness reports never mutate media and malformed queries are ignored", () => {
+  const gate = receiver();
+  assert.equal(gate.receiverReadinessStateForScreen("ready"), "ready");
+  assert.equal(gate.receiverReadinessStateForScreen("stopped"), "ready");
+  assert.equal(gate.receiverReadinessStateForScreen("playing"), "mirroring");
+  assert.equal(gate.receiverReadinessStateForScreen("lost"), "unavailable");
+  assert.equal(gate.validateReadyQuery('{"type":"receiverReadyQuery","protocolVersion":2,"requestId":"x","endpoint":"forbidden"}'), null);
+  assert.equal(gate.validateReadyQuery('{"type":"receiverReadyQuery","protocolVersion":3,"requestId":"x"}'), null);
+});
+
 test("seeks only when playback has fallen behind the live buffered range", () => {
   const gate = receiver();
   assert.equal(gate.recoverySeekTarget(29.864, 31.035, 32.069), 31.085);
@@ -73,7 +93,7 @@ test("does not change credit emission while adding playback recovery helpers", (
 
 test("declares bounded receiver-stop cleanup diagnostics", () => {
   const gate = receiver();
-  assert.equal(gate.receiverRevision, "corr-fragseq-20260927-namespace-diag-01");
+  assert.equal(gate.receiverRevision, "corr-fragseq-20261010-ready-handshake-01");
   assert.deepEqual(JSON.parse(JSON.stringify(gate.receiverStopDiagnostics)), ["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]);
 });
 

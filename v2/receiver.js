@@ -2,7 +2,7 @@
   "use strict";
 
   const RECEIVER_VERSION = "2.0.0";
-  const RECEIVER_REVISION = "corr-fragseq-20260927-namespace-diag-01";
+  const RECEIVER_REVISION = "corr-fragseq-20261010-ready-handshake-01";
   const PROTOCOL_VERSION = 2;
   const NAMESPACE = "urn:x-cast:com.ashwinbhajan.screenmirror.cmafprobe.v2";
   const MIME_TYPE = 'video/mp4; codecs="avc1.42e01f"';
@@ -44,6 +44,8 @@
 
   let context;
   let ui;
+  const receiverReadinessStateForScreen = (screen) => screen === "playing" ? "mirroring" : (screen === "lost" ? "unavailable" : "ready");
+  let receiverReadinessState = "ready";
   let capabilities = Object.freeze({ webSocketAPI: false, mediaSource: false, avcMIME: false, sourceBuffer: false, autoplay: "deferred", websocketAttempted: false, websocketAuthenticated: false, probeAckStatus: "not_attempted", terminalStatus: "capability_partial", websocketLifecycle: "not_attempted" });
   let capabilityProbe = Object.freeze({ avcMIMEOutcome: "not_tested", avcMIMEException: "none", sourceBufferOutcome: "not_tested", sourceBufferException: "none" });
   let capabilityReadyPromise = Promise.resolve(capabilities);
@@ -57,6 +59,7 @@
     reconnecting: Object.freeze(["Reconnecting…", "Keep the app open on your iPhone."])
   });
   function showScreen(state) {
+    receiverReadinessState = receiverReadinessStateForScreen(state);
     if (!ui) return;
     const copy = SCREEN_COPY[state];
     ui.panel.hidden = state === "playing";
@@ -90,6 +93,17 @@
         message.protocolVersion !== PROTOCOL_VERSION || typeof message.requestId !== "string" ||
         !REQUEST_ID.test(message.requestId) || typeof message.endpoint !== "string" || !validEndpoint(message.endpoint)) return null;
     return message;
+  }
+  function validateReadyQuery(data) {
+    const message = parse(data);
+    if (!message || Object.keys(message).length !== 3 || message.type !== "receiverReadyQuery" ||
+        message.protocolVersion !== PROTOCOL_VERSION || typeof message.requestId !== "string" ||
+        !REQUEST_ID.test(message.requestId)) return null;
+    return message;
+  }
+  function makeReadyReport(requestId, receiverState = receiverReadinessState) {
+    return { type: "receiverReadyReport", protocolVersion: PROTOCOL_VERSION, requestId,
+      receiverVersion: RECEIVER_VERSION, receiverRevision: RECEIVER_REVISION, receiverState };
   }
   function capabilityResult() {
     return capabilities.webSocketAPI && capabilities.mediaSource && capabilities.avcMIME && capabilities.sourceBuffer;
@@ -776,6 +790,11 @@
     return 0;
   }
   function receiverMessage(event) {
+    const readyQuery = event && validateReadyQuery(event.data);
+    if (readyQuery) {
+      if (event.senderId) context.sendCustomMessage(NAMESPACE, event.senderId, makeReadyReport(readyQuery.requestId));
+      return;
+    }
     const probe = event && validateProbe(event.data); if (probe) { capabilityReadyPromise.then(() => runWebSocketProbe(event.senderId, probe)); return; }
     const raw = event && parse(event.data);
     const canReportMediaValidation = raw && raw.type === "startMedia" && typeof raw.requestId === "string" && REQUEST_ID.test(raw.requestId);
@@ -913,6 +932,6 @@
     context.start(options);
 
   }
-  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ effectiveReceiverConfigHash, SCREEN_COPY, closeScreen, MIME_TYPE, RESULT, validEndpoint, validateProbe, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, makeLatencyStage, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
+  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ effectiveReceiverConfigHash, SCREEN_COPY, closeScreen, MIME_TYPE, RESULT, validEndpoint, validateProbe, validateReadyQuery, makeReadyReport, receiverReadinessStateForScreen, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, makeLatencyStage, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
   if (typeof document !== "undefined") document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", boot, { once: true }) : boot();
 })(globalThis);
