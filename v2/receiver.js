@@ -430,6 +430,29 @@
     const clearPlayTimeout = () => { if (playTimeout) { global.clearTimeout(playTimeout); playTimeout = undefined; } };
     const clearRecoveryTimeout = () => { if (lastPlayback.recoveryTimeout) { global.clearTimeout(lastPlayback.recoveryTimeout); lastPlayback.recoveryTimeout = undefined; } };
     const clearReconnectingScreenTimer = () => { if (reconnectingScreenTimer) { global.clearTimeout(reconnectingScreenTimer); reconnectingScreenTimer = undefined; } };
+    const logStopAcknowledgement = (stage, fields = {}) => {
+      if (!global.console || typeof global.console.info !== "function") return;
+      global.console.info("ScreenMirror stop acknowledgement", {
+        stage,
+        requestId: request.requestId,
+        senderId: event.senderId,
+        receiverTimeMs: receiverNow(),
+        ...fields
+      });
+    };
+    const dispatchStopAcknowledgement = (result) => {
+      logStopAcknowledgement("dispatch_attempt", { result });
+      try {
+        const returned = sendMediaResult(event.senderId, request.requestId, result);
+        // CAF exposes no completion callback for sendCustomMessage. A normal
+        // return records only local dispatch acceptance, never remote delivery.
+        logStopAcknowledgement("dispatch_returned", { result, returnType: typeof returned });
+        return returned;
+      } catch (error) {
+        logStopAcknowledgement("dispatch_threw", { result, exception: safeException(error) });
+        throw error;
+      }
+    };
     const scheduleReconnectingScreen = () => {
       if (receiverStopped || !firstRendered || reconnectingScreenTimer) return;
       reconnectingScreenTimer = global.setTimeout(() => {
@@ -450,10 +473,11 @@
       document.body.classList.remove("media-active");
       document.body.classList.add("receiver-idle");
       showScreen(screen);
-      sendMediaResult(event.senderId, request.requestId, "receiver_video_cleared");
-      sendMediaResult(event.senderId, request.requestId, "receiver_idle_screen_shown");
-      if (screen === "stopped") sendMediaResult(event.senderId, request.requestId, "receiver_casting_stopped_screen_shown");
-      if (screen === "lost") sendMediaResult(event.senderId, request.requestId, "receiver_connection_lost_screen_shown");
+      logStopAcknowledgement("screen_transition", { screen });
+      dispatchStopAcknowledgement("receiver_video_cleared");
+      dispatchStopAcknowledgement("receiver_idle_screen_shown");
+      if (screen === "stopped") dispatchStopAcknowledgement("receiver_casting_stopped_screen_shown");
+      if (screen === "lost") dispatchStopAcknowledgement("receiver_connection_lost_screen_shown");
     };
     const stop = (result) => { clearInitAppendTimeout(); clearPlayTimeout(); try { socket && socket.close(); } catch (_) {} sendMediaResult(event.senderId, request.requestId, result); };
     const safePlayRejection = (error) => {
@@ -650,7 +674,8 @@
                 return;
               }
               if (control.type === "normalStop" && control.protocolVersion === PROTOCOL_VERSION && Object.keys(control).length === 2) {
-                sendMediaResult(event.senderId, request.requestId, "receiver_stop_received");
+                logStopAcknowledgement("normal_stop_received", { controlType: control.type, controlProtocolVersion: control.protocolVersion });
+                dispatchStopAcknowledgement("receiver_stop_received");
                 clearVideoForReceiverStop("stopped");
                 try { socket.close(1000, "normal_stop"); } catch (_) {}
                 return;
