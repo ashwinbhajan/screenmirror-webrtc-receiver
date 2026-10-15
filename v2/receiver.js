@@ -6,7 +6,6 @@
   const PROTOCOL_VERSION = 2;
   const NAMESPACE = "urn:x-cast:com.ashwinbhajan.screenmirror.cmafprobe.v2";
   const MIME_TYPE = 'video/mp4; codecs="avc1.42e01f"';
-  const AUDIO_MIME_TYPE = 'audio/mp4; codecs="mp4a.40.2"';
   const MAX_MESSAGE_BYTES = 1024;
   const RETAINED_HISTORY_SECONDS = 2.5;
   const TRIM_HISTORY_THRESHOLD_SECONDS = 4;
@@ -102,11 +101,9 @@
         !REQUEST_ID.test(message.requestId)) return null;
     return message;
   }
-  function makeReadyReport(requestId, receiverState = receiverReadinessState, audioSupported = false) {
-    const report = { type: "receiverReadyReport", protocolVersion: PROTOCOL_VERSION, requestId,
+  function makeReadyReport(requestId, receiverState = receiverReadinessState) {
+    return { type: "receiverReadyReport", protocolVersion: PROTOCOL_VERSION, requestId,
       receiverVersion: RECEIVER_VERSION, receiverRevision: RECEIVER_REVISION, receiverState };
-    if (audioSupported) report.audioCapabilities = ["aac_lc_cmaf"];
-    return report;
   }
   function capabilityResult() {
     return capabilities.webSocketAPI && capabilities.mediaSource && capabilities.avcMIME && capabilities.sourceBuffer;
@@ -317,11 +314,9 @@
   }
   function validateMediaStart(data) {
     const message = parse(data);
-    const keys = message && Object.keys(message);
-    if (!message || (keys.length !== 4 && keys.length !== 5) || message.type !== "startMedia" ||
+    if (!message || Object.keys(message).length !== 4 || message.type !== "startMedia" ||
         message.protocolVersion !== PROTOCOL_VERSION || typeof message.requestId !== "string" ||
         !REQUEST_ID.test(message.requestId) || typeof message.endpoint !== "string" || !validEndpoint(message.endpoint)) return null;
-    if (keys.length === 5 && message.audioCodec !== "mp4a.40.2") return null;
     return message;
   }
   function sendMediaResult(senderId, requestId, result, telemetry, observedReceiverTime) {
@@ -380,10 +375,8 @@
       ...capabilities, frameCallback: typeof video.requestVideoFrameCallback === "function"
     })}`); } catch (_) { /* Diagnostics never gate media startup. */ }
     const pending = []; const maxPending = 8;
-    const audioRequested = request.audioCodec === "mp4a.40.2";
-    const audioPending = []; const maxAudioPending = 4;
     const flowGeneration = 1; const initialCredits = 8; let mediaReadySent = false;
-    let source; let buffer; let audioBuffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let lastAppendingFragment = null; let firstRendered = false; let playAttempted = false; let initialSeekRequested = false; let initialSeekCompleted = false; let recoverySeekPending = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let audioReadySent = false; let lastAudioType = 0; let audioCreditSequence = 0; let playTimeout; let receiverStopped = false; let stallThresholdMs = 1500; let recoveryTailSeconds = 0.05; let recoveryMinimumLeadSeconds = 0.05; let recoveryTimeoutMs = 3000; let lastPlayback = { time: 0, advancedAt: performance.now(), recoveryAwaitingProgress: false, recoveryTimeout: undefined };
+    let source; let buffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let lastAppendingFragment = null; let firstRendered = false; let playAttempted = false; let initialSeekRequested = false; let initialSeekCompleted = false; let recoverySeekPending = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let playTimeout; let receiverStopped = false; let stallThresholdMs = 1500; let recoveryTailSeconds = 0.05; let recoveryMinimumLeadSeconds = 0.05; let recoveryTimeoutMs = 3000; let lastPlayback = { time: 0, advancedAt: performance.now(), recoveryAwaitingProgress: false, recoveryTimeout: undefined };
     if (activeReceiverPagehideListener && typeof global.removeEventListener === "function") {
       global.removeEventListener("pagehide", activeReceiverPagehideListener);
     }
@@ -453,7 +446,6 @@
       clearRecoveryTimeout();
       clearReconnectingScreenTimer();
       pending.length = 0;
-      audioPending.length = 0;
       try { video.pause(); video.removeAttribute("src"); video.load(); } catch (_) {}
       document.body.classList.remove("media-active");
       document.body.classList.add("receiver-idle");
@@ -508,10 +500,6 @@
       Promise.resolve(promise).then(() => {
         clearPlayTimeout();
         sendMediaResult(event.senderId, request.requestId, "play_promise_resolved");
-        if (!receiverStopped && audioRequested && audioBuffer) {
-          video.muted = false;
-          sendMediaResult(event.senderId, request.requestId, "receiver_audio_unmuted");
-        }
       }).catch((error) => {
         clearPlayTimeout();
         sendMediaResult(event.senderId, request.requestId, safePlayRejection(error));
@@ -593,30 +581,6 @@
         stop("append_failed");
       }
     };
-    const emitAudioCredit = () => {
-      audioCreditSequence += 1;
-      sendLatency({ type: "audioCredit", protocolVersion: PROTOCOL_VERSION, generation: flowGeneration, credits: 1, creditSequence: audioCreditSequence });
-    };
-    const appendNextAudio = () => {
-      if (!audioBuffer || audioBuffer.updating || !audioPending.length) return;
-      const item = audioPending.shift(); lastAudioType = item.type;
-      try {
-        audioBuffer.appendBuffer(item.payload);
-        sendMediaResult(event.senderId, request.requestId, item.type === 3 ? "audio_init_append_started" : "audio_fragment_append_started");
-      } catch (_) {
-        sendMediaResult(event.senderId, request.requestId, "audio_append_failed_video_continues");
-        audioPending.length = 0;
-      }
-    };
-    const enqueueAudio = (item) => {
-      if (!audioBuffer) { sendMediaResult(event.senderId, request.requestId, "audio_fragment_ignored_not_ready"); return; }
-      if (audioPending.length >= maxAudioPending) {
-        audioPending.shift();
-        sendMediaResult(event.senderId, request.requestId, "audio_queue_evicted");
-      }
-      audioPending.push(item);
-      appendNextAudio();
-    };
     const enqueue = (item) => {
       if (pending.length >= maxPending) { pending.splice(0, pending.length - maxPending + 1); }
       pending.push(item); appendBacklogHighWatermark = Math.max(appendBacklogHighWatermark, pending.length); appendNext();
@@ -627,31 +591,6 @@
         try {
           buffer = source.addSourceBuffer(MIME_TYPE);
           sendMediaResult(event.senderId, request.requestId, "source_buffer_created");
-          if (audioRequested && global.MediaSource.isTypeSupported(AUDIO_MIME_TYPE) === true) {
-            try {
-              audioBuffer = source.addSourceBuffer(AUDIO_MIME_TYPE);
-              sendMediaResult(event.senderId, request.requestId, "receiver_audio_source_buffer_created");
-              audioReadySent = true;
-              sendMediaResult(event.senderId, request.requestId, "receiver_audio_ready");
-              sendLatency({ type: "audioReady", protocolVersion: PROTOCOL_VERSION, generation: flowGeneration, initialCredits: maxAudioPending });
-              audioBuffer.addEventListener("updateend", () => {
-                if (lastAudioType === 3) {
-                  sendMediaResult(event.senderId, request.requestId, "audio_init_append_updateend");
-                } else if (lastAudioType === 4 && audioReadySent) {
-                  sendMediaResult(event.senderId, request.requestId, "audio_fragment_append_updateend");
-                  emitAudioCredit();
-                }
-                appendNextAudio();
-              });
-              audioBuffer.addEventListener("error", () => {
-                sendMediaResult(event.senderId, request.requestId, "receiver_audio_error_video_continues");
-                audioPending.length = 0;
-              });
-            } catch (_) {
-              audioBuffer = null;
-              sendMediaResult(event.senderId, request.requestId, "receiver_audio_unsupported_video_continues");
-            }
-          }
           buffer.addEventListener("updateend", () => {
             if (lastAppendingType === 1 && initAppendPending) {
               initAppendPending = false;
@@ -742,10 +681,6 @@
               }
               firstKeyframe = true; enqueue({ ...envelope, fragment }); return;
             }
-            if (envelope.type === 3 || envelope.type === 4) {
-              if (!audioRequested) { sendMediaResult(event.senderId, request.requestId, "audio_envelope_rejected_not_negotiated"); return; }
-              enqueueAudio(envelope); return;
-            }
             stop("binary_envelope_invalid");
           };
           let socketFailed = false;
@@ -824,7 +759,7 @@
   function parseEnvelope(value) {
     if (!(value instanceof ArrayBuffer) || value.byteLength < 14) return null;
     const bytes = new Uint8Array(value); const view = new DataView(value);
-    if (String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]) !== "SMC1" || bytes[4] !== 2 || ![1, 2, 3, 4].includes(bytes[5])) return null;
+    if (String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]) !== "SMC1" || bytes[4] !== 2 || (bytes[5] !== 1 && bytes[5] !== 2)) return null;
     const length = view.getUint32(10); if (length !== bytes.length - 14 || length > 1048576) return null;
     return { type: bytes[5], sequence: view.getUint32(6), payload: value.slice(14) };
   }
@@ -857,11 +792,7 @@
   function receiverMessage(event) {
     const readyQuery = event && validateReadyQuery(event.data);
     if (readyQuery) {
-      capabilityReadyPromise.then((runtime) => {
-        const audioSupported = !!(runtime && runtime.mediaSource) && global.MediaSource.isTypeSupported(AUDIO_MIME_TYPE) === true;
-        if (event.senderId) context.sendCustomMessage(NAMESPACE, event.senderId,
-          makeReadyReport(readyQuery.requestId, receiverReadinessState, audioSupported));
-      });
+      if (event.senderId) context.sendCustomMessage(NAMESPACE, event.senderId, makeReadyReport(readyQuery.requestId));
       return;
     }
     const probe = event && validateProbe(event.data); if (probe) { capabilityReadyPromise.then(() => runWebSocketProbe(event.senderId, probe)); return; }
@@ -1001,6 +932,6 @@
     context.start(options);
 
   }
-  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ effectiveReceiverConfigHash, SCREEN_COPY, closeScreen, MIME_TYPE, AUDIO_MIME_TYPE, RESULT, validEndpoint, validateProbe, validateMediaStart, validateReadyQuery, makeReadyReport, receiverReadinessStateForScreen, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, makeLatencyStage, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
+  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ effectiveReceiverConfigHash, SCREEN_COPY, closeScreen, MIME_TYPE, RESULT, validEndpoint, validateProbe, validateReadyQuery, makeReadyReport, receiverReadinessStateForScreen, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, makeLatencyStage, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
   if (typeof document !== "undefined") document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", boot, { once: true }) : boot();
 })(globalThis);
