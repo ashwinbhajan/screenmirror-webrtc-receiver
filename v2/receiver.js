@@ -13,6 +13,12 @@
   const LIVE_EDGE_FAST_THRESHOLD_SECONDS = 1.25;
   const LIVE_EDGE_NORMAL_THRESHOLD_SECONDS = 0.75;
   const LIVE_EDGE_FAST_PLAYBACK_RATE = 1.2;
+  const HEALTHY_CATCHUP_TRIGGER_SECONDS = 6;
+  const HEALTHY_CATCHUP_REARM_SECONDS = 3;
+  const HEALTHY_CATCHUP_MARGIN_SECONDS = 1;
+  const HEALTHY_CATCHUP_MIN_JUMP_SECONDS = 2;
+  const HEALTHY_CATCHUP_PERSIST_MS = 2500;
+  const HEALTHY_CATCHUP_COOLDOWN_MS = 10000;
   const REQUEST_ID = /^[A-Za-z0-9._-]{1,64}$/;
   const RESULT = Object.freeze({
     PASS: "capability_pass",
@@ -165,6 +171,58 @@
     if (lead >= LIVE_EDGE_FAST_THRESHOLD_SECONDS) return LIVE_EDGE_FAST_PLAYBACK_RATE;
     if (currentRate > 1 && lead <= LIVE_EDGE_NORMAL_THRESHOLD_SECONDS) return 1;
     return null;
+  }
+  function readBufferedRanges(ranges) {
+    const result = [];
+    try {
+      for (let i = 0; ranges && i < Math.min(ranges.length, 8); i += 1) {
+        const start = ranges.start(i); const end = ranges.end(i);
+        if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return [];
+        result.push({ start, end });
+      }
+    } catch (_) { return []; }
+    return result;
+  }
+  function containingRange(ranges, position) {
+    if (!Number.isFinite(position)) return null;
+    return ranges.find((range) => range.start <= position && position < range.end) || null;
+  }
+  // An appended sync sample, rather than an arbitrary buffered time, is the
+  // only eligible healthy catch-up destination. The same media element seeks
+  // both tracks; AAC additionally requires one continuous common range.
+  function createHealthyLiveEdgeCatchup(runID) {
+    let highSince = null; let lastSeekAt = -Infinity; let armed = true; let seekPending = false; let closed = false;
+    return {
+      consider(sample) {
+        if (closed || sample.runID !== runID) return null;
+        const now = sample.nowMs;
+        const videoRange = containingRange(sample.videoRanges || [], sample.currentTime);
+        const audioRange = sample.audioRequested ? containingRange(sample.audioRanges || [], sample.currentTime) : null;
+        const healthy = Number.isFinite(now) && videoRange && sample.readyState >= 3 && !sample.paused
+          && !sample.ended && !sample.seeking && !sample.mediaError && sample.sourceOpen
+          && !sample.videoUpdating && sample.pendingDepth <= 1 && sample.progressAgeMs <= 750
+          && sample.appendAgeMs <= 1000 && (sample.renderAgeMs === null || sample.renderAgeMs <= 750)
+          && (!sample.audioRequested || (sample.audioReady && audioRange && !sample.audioUpdating));
+        if (!healthy) { highSince = null; return null; }
+        const end = sample.audioRequested ? Math.min(videoRange.end, audioRange.end) : videoRange.end;
+        const lead = end - sample.currentTime;
+        if (lead <= HEALTHY_CATCHUP_REARM_SECONDS && !seekPending) armed = true;
+        if (lead < HEALTHY_CATCHUP_TRIGGER_SECONDS || !armed || seekPending) { highSince = null; return null; }
+        if (highSince === null) highSince = now;
+        if (now - highSince < HEALTHY_CATCHUP_PERSIST_MS || now - lastSeekAt < HEALTHY_CATCHUP_COOLDOWN_MS) return null;
+        const latest = end - HEALTHY_CATCHUP_MARGIN_SECONDS;
+        const candidates = (sample.syncPoints || []).filter((point) => Number.isFinite(point)
+          && point >= videoRange.start && point < videoRange.end
+          && (!sample.audioRequested || (point >= audioRange.start && point < audioRange.end))
+          && point <= latest && point - sample.currentTime >= HEALTHY_CATCHUP_MIN_JUMP_SECONDS);
+        const sync = candidates[candidates.length - 1];
+        if (sync === undefined) return null;
+        highSince = null; armed = false; seekPending = true; lastSeekAt = now;
+        return sync;
+      },
+      completeSeek(run) { if (!closed && run === runID) seekPending = false; },
+      close() { closed = true; highSince = null; seekPending = false; }
+    };
   }
   function makeLatencyStage(generation, sequence, stage, receiverTimeMs, bufferLeadMs, pendingDepth) {
     if (!Number.isInteger(generation) || generation <= 0 || !Number.isInteger(sequence) || sequence <= 0 ||
@@ -396,6 +454,7 @@
   }
   function runMedia(event, request) {
     const mediaRun = ++activeMediaRun;
+    const healthyCatchup = createHealthyLiveEdgeCatchup(mediaRun);
     sendCapabilityDiagnostics(event, request);
     if (!capabilityResult()) {
       sendReceiverDiagnostic(event, request, "receiver_error_before_disconnect_unsupported");
@@ -414,7 +473,7 @@
     const audioPending = []; const maxAudioPending = 4;
     const flowGeneration = 1; const initialCredits = 8; let mediaReadySent = false;
     let mediaAuthenticated = false; let audioInitAppended = false;
-    let source; let buffer; let audioBuffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let lastAppendingFragment = null; let firstRendered = false; let playAttempted = false; let initialSeekRequested = false; let initialSeekCompleted = false; let recoverySeekPending = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let lastAudioType = 0; let audioCreditSequence = 0; let playTimeout; let receiverStopped = false; let stallThresholdMs = 1500; let recoveryTailSeconds = 0.05; let recoveryMinimumLeadSeconds = 0.05; let recoveryTimeoutMs = 3000; let lastPlayback = { time: 0, advancedAt: performance.now(), recoveryAwaitingProgress: false, recoveryTimeout: undefined };
+    let source; let buffer; let audioBuffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let lastAppendingFragment = null; let lastAppendingSyncTimes = []; const syncPoints = []; let firstRendered = false; let playAttempted = false; let initialSeekRequested = false; let initialSeekCompleted = false; let recoverySeekPending = false; let healthySeekPending = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let lastAudioType = 0; let audioTrimPending = false; let audioCreditSequence = 0; let playTimeout; let receiverStopped = false; let stallThresholdMs = 1500; let recoveryTailSeconds = 0.05; let recoveryMinimumLeadSeconds = 0.05; let recoveryTimeoutMs = 3000; let lastAppendAtMs = null; let lastRenderAtMs = null; let lastPlayback = { time: 0, advancedAt: performance.now(), recoveryAwaitingProgress: false, recoveryTimeout: undefined };
     if (activeReceiverPagehideListener && typeof global.removeEventListener === "function") {
       global.removeEventListener("pagehide", activeReceiverPagehideListener);
     }
@@ -464,6 +523,7 @@
       (now, metadata, correlation) => sendLatency({ type: "renderedFrame", generation: correlation.generation, sequence: correlation.sequence, receiverTimeMs: now, mediaTimeMs: Math.round(metadata.mediaTime * 1000), presentedFrames: Number.isFinite(metadata.presentedFrames) ? metadata.presentedFrames : 0, bufferLeadMs: metadata.bufferLeadMs }));
     const observeFrame = (now, metadata) => {
       if (receiverStopped) return;
+      lastRenderAtMs = now;
       confirmFirstRendered(metadata);
       pacing.frame(now, metadata);
       correlations.frame(now, { ...metadata, bufferLeadMs: Math.round(bufferedLead(video) * 1000) });
@@ -513,6 +573,9 @@
     const clearVideoForReceiverStop = (screen) => {
       if (receiverStopped) return;
       receiverStopped = true;
+      healthyCatchup.close();
+      healthySeekPending = false;
+      recoverySeekPending = false;
       correlations.finish(performance.now());
       pacing.stop(correlations.snapshot().counts);
       if (frameCallbackID !== undefined && typeof video.cancelVideoFrameCallback === "function") video.cancelVideoFrameCallback(frameCallbackID);
@@ -520,6 +583,7 @@
       clearReconnectingScreenTimer();
       pending.length = 0;
       audioPending.length = 0;
+      audioTrimPending = false;
       initialAudioCredits.close();
       mediaAuthenticated = false;
       try { video.pause(); video.removeAttribute("src"); video.load(); } catch (_) {}
@@ -642,8 +706,41 @@
         sendMediaResult(event.senderId, request.requestId, "receiver_playback_recovery_failed");
       }
     };
+    const catchUpHealthyPlayback = () => {
+      if (receiverStopped || mediaRun !== activeMediaRun || !firstRendered || !initialSeekCompleted
+          || recoverySeekPending || !mediaAuthenticated || !socket || socket.readyState !== 1
+          || !buffer || buffer.updating || (audioRequested && audioBuffer && audioBuffer.updating)) return;
+      const now = performance.now();
+      const target = healthyCatchup.consider({
+        runID: mediaRun, nowMs: now, currentTime: video.currentTime,
+        videoRanges: readBufferedRanges(video.buffered),
+        audioRanges: audioRequested && audioBuffer ? readBufferedRanges(audioBuffer.buffered) : [],
+        syncPoints, audioRequested, audioReady: !!audioBuffer && audioInitAppended && !video.muted,
+        readyState: video.readyState, paused: video.paused, ended: video.ended, seeking: video.seeking,
+        mediaError: !!video.error, sourceOpen: !!source && source.readyState === "open",
+        videoUpdating: !!buffer && buffer.updating, audioUpdating: !!audioBuffer && audioBuffer.updating,
+        pendingDepth: pending.length, progressAgeMs: now - lastPlayback.advancedAt,
+        appendAgeMs: lastAppendAtMs === null ? Infinity : now - lastAppendAtMs,
+        renderAgeMs: lastRenderAtMs === null ? null : now - lastRenderAtMs
+      });
+      if (target === null) return;
+      recoverySeekPending = true;
+      healthySeekPending = true;
+      playbackTelemetry("healthy_live_edge_catchup_requested");
+      sendMediaResult(event.senderId, request.requestId, "healthy_live_edge_catchup_seek");
+      try { video.currentTime = target; }
+      catch (_) {
+        recoverySeekPending = false;
+        healthySeekPending = false;
+        healthyCatchup.completeSeek(mediaRun);
+        sendMediaResult(event.senderId, request.requestId, "healthy_live_edge_catchup_seek_failed");
+      }
+    };
     const regulateLiveEdge = () => {
-      const nextRate = liveEdgePlaybackRate(bufferedLead(video), video.playbackRate);
+      // One element carries both tracks; never speed audible AAC for long.
+      const nextRate = audioRequested
+        ? (video.playbackRate === 1 ? null : 1)
+        : liveEdgePlaybackRate(bufferedLead(video), video.playbackRate);
       if (nextRate === null || nextRate === video.playbackRate) return;
       video.playbackRate = nextRate;
       sendMediaResult(event.senderId, request.requestId, nextRate > 1 ? "live_edge_catchup_enabled" : "live_edge_catchup_disabled");
@@ -651,6 +748,7 @@
     const appendNext = () => {
       if (!buffer || buffer.updating || !pending.length) return;
       const item = pending.shift(); lastAppendingType = item.type; lastAppendingFragment = item.fragment || null;
+      lastAppendingSyncTimes = item.syncTimes || [];
       if (item.type === 1) {
         initAppendPending = true;
         sendMediaResult(event.senderId, request.requestId, `init_append_started_len_${item.payload.byteLength}`);
@@ -678,6 +776,7 @@
       try { sendMediaResult(event.senderId, request.requestId, result); }
       catch (_) { /* Audio diagnostics cannot block video cleanup. */ }
       audioPending.length = 0;
+      audioTrimPending = false;
       initialAudioCredits.close();
       const failedBuffer = audioBuffer;
       audioBuffer = null;
@@ -699,6 +798,16 @@
       } catch (_) {
         degradeAudio("audio_append_failed_video_continues");
       }
+    };
+    const trimAudioHistory = () => {
+      if (receiverStopped || !audioBuffer || !audioInitAppended || audioBuffer.updating || typeof audioBuffer.remove !== "function") return false;
+      const ranges = readBufferedRanges(audioBuffer.buffered);
+      const current = containingRange(ranges, video.currentTime);
+      const end = current ? bufferedTrimEnd(video.currentTime, ranges[0].start, current.end) : null;
+      if (end === null) return false;
+      audioTrimPending = true;
+      try { audioBuffer.remove(0, end); return true; }
+      catch (_) { audioTrimPending = false; return false; }
     };
     const enqueueAudio = (item) => {
       if (!audioBuffer) { sendMediaResult(event.senderId, request.requestId, "audio_fragment_ignored_not_ready"); return; }
@@ -726,6 +835,8 @@
               sendMediaResult(event.senderId, request.requestId, "receiver_audio_ready");
               initialAudioCredits.ready();
               audioBuffer.addEventListener("updateend", () => {
+                if (receiverStopped || mediaRun !== activeMediaRun) return;
+                if (audioTrimPending) { audioTrimPending = false; appendNextAudio(); return; }
                 if (lastAudioType === 3) {
                   audioInitAppended = true;
                   sendMediaResult(event.senderId, request.requestId, "audio_init_append_updateend");
@@ -733,6 +844,7 @@
                   sendMediaResult(event.senderId, request.requestId, "audio_fragment_append_updateend");
                   emitAudioCredit();
                 }
+                if (trimAudioHistory()) return;
                 appendNextAudio();
               });
               audioBuffer.addEventListener("error", () => {
@@ -744,6 +856,7 @@
             }
           }
           buffer.addEventListener("updateend", () => {
+            if (receiverStopped || mediaRun !== activeMediaRun) return;
             if (lastAppendingType === 1 && initAppendPending) {
               initAppendPending = false;
               clearInitAppendTimeout();
@@ -758,6 +871,11 @@
             if (lastAppendingType === 2 && mediaAppendPending) {
               mediaAppendPending = false;
               appendedFragments += 1;
+              lastAppendAtMs = performance.now();
+              for (const syncTime of lastAppendingSyncTimes) {
+                syncPoints.push(syncTime);
+                if (syncPoints.length > 16) syncPoints.shift();
+              }
               correlations.append(lastAppendingFragment, performance.now(), captureStageMetrics());
               pacing.append(performance.now());
               sendMediaResult(event.senderId, request.requestId, "media_append_updateend");
@@ -768,10 +886,14 @@
             attemptPlay();
             recoverPlaybackPosition();
             detectPlaybackStall();
+            catchUpHealthyPlayback();
             regulateLiveEdge();
             // Preserve a full GOP behind the playhead. Trimming at 0.1 seconds
             // can evict the current decode dependency and force a recovery seek.
-            const trimEnd = video.buffered.length ? bufferedTrimEnd(video.currentTime, video.buffered.start(0), video.buffered.end(0)) : null;
+            const videoRanges = readBufferedRanges(video.buffered);
+            const currentVideoRange = containingRange(videoRanges, video.currentTime);
+            const trimEnd = currentVideoRange
+              ? bufferedTrimEnd(video.currentTime, videoRanges[0].start, currentVideoRange.end) : null;
             if (trimEnd !== null && typeof buffer.remove === "function" && !buffer.updating) {
               try { buffer.remove(0, trimEnd); } catch (_) {}
             }
@@ -834,7 +956,9 @@
               } else {
                 sendMediaResult(event.senderId, request.requestId, "media_fragment_layout_invalid");
               }
-              firstKeyframe = true; enqueue({ ...envelope, fragment }); return;
+              firstKeyframe = true;
+              enqueue({ ...envelope, fragment, syncTimes: summary ? summary.syncTimes : [] });
+              return;
             }
             if (envelope.type === 3 || envelope.type === 4) {
               if (!audioRequested) { sendMediaResult(event.senderId, request.requestId, "audio_envelope_rejected_not_negotiated"); return; }
@@ -886,10 +1010,17 @@
       });
       video.addEventListener("seeking", () => sendMediaResult(event.senderId, request.requestId, recoverySeekPending ? "recovery_seek_started" : "initial_seek_started"));
       video.addEventListener("seeked", () => {
+        if (receiverStopped || mediaRun !== activeMediaRun) return;
         if (recoverySeekPending) {
           recoverySeekPending = false;
-          sendMediaResult(event.senderId, request.requestId, "recovery_seek_completed");
-          try { Promise.resolve(video.play()).catch((error) => sendMediaResult(event.senderId, request.requestId, safePlayRejection(error))); } catch (_) { sendMediaResult(event.senderId, request.requestId, "recovery_play_synchronous_exception"); }
+          healthyCatchup.completeSeek(mediaRun);
+          const healthy = healthySeekPending;
+          healthySeekPending = false;
+          sendMediaResult(event.senderId, request.requestId,
+            healthy ? "healthy_live_edge_catchup_completed" : "recovery_seek_completed");
+          if (!healthy || video.paused) {
+            try { Promise.resolve(video.play()).catch((error) => sendMediaResult(event.senderId, request.requestId, safePlayRejection(error))); } catch (_) { sendMediaResult(event.senderId, request.requestId, "recovery_play_synchronous_exception"); }
+          }
           return;
         }
         if (!initialSeekRequested) return;
@@ -915,6 +1046,7 @@
             playbackTelemetry("receiver_playback_recovered");
           }
         }
+        catchUpHealthyPlayback();
         if (latencyFallback && latencyCorrelations.size) { const mediaTime = video.currentTime; const nearest = Array.from(latencyCorrelations.values()).sort((a, b) => Math.abs(a.mediaTime - mediaTime) - Math.abs(b.mediaTime - mediaTime))[0]; if (nearest && Math.abs(nearest.mediaTime - mediaTime) <= 0.05) { latencyCorrelations.delete(nearest.sequence); sendLatency({ type: "renderedFrame", generation: nearest.generation, sequence: nearest.sequence, receiverTimeMs: performance.now(), mediaTimeMs: Math.round(mediaTime * 1000), presentedFrames: 0, bufferLeadMs: Math.round(bufferedLead(video) * 1000), fallback: true }); } }
       });
     } catch (_) { stop("media_source_failed"); }
@@ -946,7 +1078,33 @@
     const dataOffset = view.getUint32(trun.offset + 16); const payloadStart = moof.offset + dataOffset;
     if (payloadStart < mdat.offset + 8 || payloadStart + 5 > mdat.offset + mdat.size) return null;
     const nalLength = view.getUint32(payloadStart); if (nalLength === 0 || payloadStart + 4 + nalLength > mdat.offset + mdat.size) return null;
-    return { sequence: view.getUint32(mfhd.offset + 12), sampleCount: view.getUint32(trun.offset + 12), decodeTime, dataOffset, payloadLength: mdat.size - 8, firstNALType: bytes[payloadStart + 4] & 0x1f };
+    // The sender marks every IDR sample in trun, including an IDR that is
+    // not the first sample of a fragment. Bound parsing and index only the
+    // successfully appended random-access points.
+    const sampleCount = view.getUint32(trun.offset + 12);
+    const trunVersion = bytes[trun.offset + 8];
+    const flags = view.getUint32(trun.offset + 8) & 0x00ffffff;
+    const hasSampleFields = (flags & 0x000701) === 0x000701;
+    const hasCTO = (flags & 0x000800) !== 0;
+    const stride = hasCTO ? 16 : 12;
+    const syncTimes = [];
+    if (hasSampleFields && sampleCount > 0 && sampleCount <= 32
+        && trun.offset + 20 + sampleCount * stride <= trun.offset + trun.size) {
+      let time = decodeTime; let totalSize = 0;
+      for (let i = 0; i < sampleCount; i += 1) {
+        const offset = trun.offset + 20 + i * stride;
+        const duration = view.getUint32(offset); const size = view.getUint32(offset + 4);
+        const sampleFlags = view.getUint32(offset + 8);
+        totalSize += size;
+        if (!duration || !size || totalSize > mdat.size - 8) { syncTimes.length = 0; break; }
+        const cto = hasCTO ? (trunVersion === 1 ? view.getInt32(offset + 12) : view.getUint32(offset + 12)) : 0;
+        if (sampleFlags === 0x02000000 && Number.isSafeInteger(time + cto) && time + cto >= 0) {
+          syncTimes.push((time + cto) / 90000);
+        }
+        time += duration;
+      }
+    }
+    return { sequence: view.getUint32(mfhd.offset + 12), sampleCount, decodeTime, dataOffset, payloadLength: mdat.size - 8, firstNALType: bytes[payloadStart + 4] & 0x1f, syncStart: syncTimes.includes(decodeTime / 90000), syncTimes };
   }
   function bufferedLead(video) {
     for (let i = 0; i < video.buffered.length; i += 1) if (video.currentTime >= video.buffered.start(i) && video.currentTime <= video.buffered.end(i)) return video.buffered.end(i) - video.currentTime;
@@ -1124,6 +1282,6 @@
     context.start(options);
 
   }
-  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ effectiveReceiverConfigHash, SCREEN_COPY, closeScreen, MIME_TYPE, AUDIO_MIME_TYPE, RESULT, validEndpoint, validateProbe, validateMediaStart, validateReadyQuery, makeReadyReport, receiverReadinessStateForScreen, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, makeLatencyStage, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createInitialAudioCreditDelivery, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
+  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ effectiveReceiverConfigHash, SCREEN_COPY, closeScreen, MIME_TYPE, AUDIO_MIME_TYPE, RESULT, validEndpoint, validateProbe, validateMediaStart, validateReadyQuery, makeReadyReport, receiverReadinessStateForScreen, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, readBufferedRanges, createHealthyLiveEdgeCatchup, summarizeFragment, makeLatencyStage, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createInitialAudioCreditDelivery, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
   if (typeof document !== "undefined") document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", boot, { once: true }) : boot();
 })(globalThis);
