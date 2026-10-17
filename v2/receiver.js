@@ -957,8 +957,11 @@
     if (readyQuery) {
       capabilityReadyPromise.then((runtime) => {
         const audioSupported = !!(runtime && runtime.mediaSource) && global.MediaSource.isTypeSupported(AUDIO_MIME_TYPE) === true;
-        if (event.senderId) context.sendCustomMessage(NAMESPACE, event.senderId,
-          makeReadyReport(readyQuery.requestId, receiverReadinessState, audioSupported));
+        if (event.senderId) {
+          context.sendCustomMessage(NAMESPACE, event.senderId,
+            makeReadyReport(readyQuery.requestId, receiverReadinessState, audioSupported));
+          lifecycleDiagnostics.readySent(readyQuery.requestId);
+        }
       });
       return;
     }
@@ -971,6 +974,7 @@
     }
     const media = event && validateMediaStart(event.data);
     if (media) {
+      lifecycleDiagnostics.mediaRequested();
       emitReceiverStartup(event, media);
       sendReceiverDiagnostic(event, media, `receiver_page_loaded_revision_${RECEIVER_REVISION}`);
       sendReceiverDiagnostic(event, media, "receiver_media_payload_validation_passed");
@@ -1101,6 +1105,148 @@
       return capabilities;
     });
   }
+  // Observability only. No timers, transport messages, CAF mutations or media.
+  function createLifecycleDiagnostics(env, scriptStartedAt) {
+    const VERSION = "caf-idle-observe-20261017-01";
+    const MAX_EVENTS = 64, MAX_NORMAL = 48, WINDOW_MS = 360000;
+    const records = [], counts = Object.create(null);
+    const critical = new Set(["receiver_caf_shutdown", "receiver_caf_error", "receiver_pagehide",
+      "receiver_beforeunload", "receiver_page_error", "receiver_promise_rejection"]);
+    const names = new Set(["receiver_page_started", "receiver_caf_context_initialized",
+      "receiver_caf_start_requested", "receiver_caf_start_returned", "receiver_caf_options_snapshot", "receiver_caf_ready",
+      "receiver_caf_shutdown", "receiver_sender_connected", "receiver_sender_disconnected",
+      "receiver_caf_error", "receiver_caf_visibility_changed", "receiver_caf_standby_changed",
+      "receiver_visibility_changed", "receiver_pagehide", "receiver_beforeunload",
+      "receiver_page_error", "receiver_promise_rejection", "receiver_ready_transmitted",
+      "receiver_ready_correlation", "receiver_media_request_observed", "receiver_diag_hook_unavailable"]);
+    const token = (value, allowed) => typeof value === "string" && allowed.includes(value.toUpperCase())
+      ? value.toUpperCase() : "UNKNOWN";
+    const safeError = (value) => {
+      try { return token(value && value.name, ["ERROR", "TYPEERROR", "REFERENCEERROR", "RANGEERROR",
+        "SYNTAXERROR", "URIERROR", "EVALERROR", "AGGREGATEERROR", "DOMEXCEPTION"]); }
+      catch (_) { return "UNKNOWN"; }
+    };
+    const now = () => { try { const n = env.performance && env.performance.now(); return Number.isFinite(n) ? n : null; } catch (_) { return null; } };
+    const wall = () => { try { const n = env.Date.now(); return Number.isFinite(n) ? n : null; } catch (_) { return null; } };
+    const startedAt = Number.isFinite(scriptStartedAt) ? scriptStartedAt : now(), startedWall = wall();
+    let context = null, framework = null, normalCount = 0, elapsed = 0, recording = false, mediaRequested = false;
+    let nonce = "unavailable";
+    try { nonce = `page_${env.Math.random().toString(36).slice(2, 14)}`; } catch (_) {}
+    function snapshotState() {
+      const state = { cafVersion: "unavailable", cafState: "UNKNOWN", playerState: "UNKNOWN", cafVisibility: "UNKNOWN", cafStandby: "UNKNOWN", senderCount: null };
+      try {
+        const version = framework && framework.VERSION;
+        if (typeof version === "string" && /^[A-Za-z0-9._-]{1,32}$/.test(version)) state.cafVersion = version;
+      } catch (_) {}
+      try { if (context && typeof context.getSystemState === "function") state.cafState = token(context.getSystemState(),
+        ["NOT_STARTED", "STARTING_IN_BACKGROUND", "STARTING", "READY", "STOPPING_IN_BACKGROUND", "STOPPING"]); } catch (_) {}
+      try { if (context && typeof context.getVisibilityState === "function") state.cafVisibility = token(context.getVisibilityState(), ["VISIBLE", "NOT_VISIBLE", "UNKNOWN"]); } catch (_) {}
+      try { if (context && typeof context.getStandbyState === "function") state.cafStandby = token(context.getStandbyState(), ["STANDBY", "NOT_STANDBY", "UNKNOWN"]); } catch (_) {}
+      try {
+        const player = context && typeof context.getPlayerManager === "function" && context.getPlayerManager();
+        if (player && typeof player.getPlayerState === "function") state.playerState = token(player.getPlayerState(),
+          ["IDLE", "LOADING", "BUFFERING", "PLAYING", "PAUSED"]);
+      } catch (_) {}
+      try {
+        const senders = context && typeof context.getSenders === "function" && context.getSenders();
+        if (Array.isArray(senders)) state.senderCount = Math.min(16, senders.length);
+      } catch (_) {}
+      return state;
+    }
+    function record(name, detail) {
+      if (recording) return null;
+      recording = true;
+      try {
+        const current = now(), currentWall = wall();
+        const delta = current !== null && startedAt !== null ? current - startedAt
+          : currentWall !== null && startedWall !== null ? currentWall - startedWall : 0;
+        elapsed = Math.max(elapsed, Number.isFinite(delta) ? delta : 0);
+        const important = critical.has(name);
+        if (!names.has(name) || elapsed > WINDOW_MS || records.length >= MAX_EVENTS
+          || (!important && normalCount >= MAX_NORMAL) || (counts[name] || 0) >= (important ? 2 : 6)) return null;
+        counts[name] = (counts[name] || 0) + 1;
+        if (!important) normalCount += 1;
+        const entry = { event: name, diagnosticVersion: VERSION, pageNonce: nonce,
+          sequence: records.length + 1, elapsedMs: Math.round(elapsed), monotonicMs: current,
+          wallTimeMs: currentWall, receiverRevision: RECEIVER_REVISION, mediaRequested, ...snapshotState() };
+        try { entry.documentVisibility = token(env.document && env.document.visibilityState, ["VISIBLE", "HIDDEN", "PRERENDER", "UNLOADED"]); } catch (_) {}
+        detail = detail || {};
+        if (typeof detail.persisted === "boolean") entry.persisted = detail.persisted;
+        if (typeof detail.errorClass === "string") entry.errorClass = token(detail.errorClass,
+          ["ERROR", "TYPEERROR", "REFERENCEERROR", "RANGEERROR", "SYNTAXERROR", "URIERROR", "EVALERROR", "AGGREGATEERROR", "DOMEXCEPTION"]);
+        if (typeof detail.disconnectReason === "string") entry.disconnectReason = token(detail.disconnectReason,
+          ["REQUESTED_BY_SENDER", "ERROR", "UNKNOWN"]);
+        if (typeof detail.requestHash === "string" && /^[0-9a-f]{24}$/.test(detail.requestHash)) entry.requestHash = detail.requestHash;
+        if (Number.isInteger(detail.readySequence) && detail.readySequence > 0 && detail.readySequence <= MAX_EVENTS) entry.readySequence = detail.readySequence;
+        if (typeof detail.phase === "string") entry.phase = token(detail.phase, ["GLOBAL", "CAF", "PAGE"]);
+        if (typeof detail.idleTimeoutOption === "string") entry.idleTimeoutOption = token(detail.idleTimeoutOption, ["DEFAULT", "TRUE", "FALSE"]);
+        if (typeof detail.maxInactivityOption === "string") entry.maxInactivityOption = token(detail.maxInactivityOption, ["DEFAULT", "EXPLICIT", "UNKNOWN"]);
+        if (Number.isFinite(detail.maxInactivitySeconds) && detail.maxInactivitySeconds >= 0 && detail.maxInactivitySeconds <= 3600) entry.maxInactivitySeconds = detail.maxInactivitySeconds;
+        const frozen = Object.freeze(entry);
+        records.push(frozen);
+        try { if (env.console && typeof env.console.info === "function") env.console.info("ScreenMirror lifecycle", frozen); } catch (_) {}
+        return entry.sequence;
+      } catch (_) { return null; }
+      finally { recording = false; }
+    }
+    function listen(target, event, callback, phase) {
+      try { if (target && typeof target.addEventListener === "function") target.addEventListener(event, (value) => { try { callback(value); } catch (_) {} }); }
+      catch (_) { record("receiver_diag_hook_unavailable", { phase }); }
+    }
+    function installGlobal() {
+      listen(env.document, "visibilitychange", () => record("receiver_visibility_changed"), "PAGE");
+      listen(env, "pagehide", (event) => record("receiver_pagehide", { persisted: !!(event && event.persisted) }), "GLOBAL");
+      listen(env, "beforeunload", () => { record("receiver_beforeunload"); }, "GLOBAL");
+      listen(env, "error", (event) => record("receiver_page_error", { errorClass: safeError(event && event.error) }), "GLOBAL");
+      listen(env, "unhandledrejection", (event) => record("receiver_promise_rejection", { errorClass: safeError(event && event.reason) }), "GLOBAL");
+      record("receiver_page_started");
+    }
+    function installCAF(value, api) {
+      context = value; framework = api;
+      record("receiver_caf_context_initialized");
+      const mapping = { READY: "receiver_caf_ready", SHUTDOWN: "receiver_caf_shutdown",
+        SENDER_CONNECTED: "receiver_sender_connected", SENDER_DISCONNECTED: "receiver_sender_disconnected",
+        ERROR: "receiver_caf_error", VISIBILITY_CHANGED: "receiver_caf_visibility_changed",
+        STANDBY_CHANGED: "receiver_caf_standby_changed" };
+      for (const key of Object.keys(mapping)) {
+        try {
+          const type = api && api.system && api.system.EventType && api.system.EventType[key];
+          if (typeof type !== "string") continue;
+          listen(context, type, (event) => record(mapping[key], key === "SENDER_DISCONNECTED"
+            ? { disconnectReason: event && event.reason } : {}), "CAF");
+        } catch (_) { record("receiver_diag_hook_unavailable", { phase: "CAF" }); }
+      }
+    }
+    function readySent(requestID) {
+      const sequence = record("receiver_ready_transmitted");
+      // Never await diagnostics or put identifiers in console/Ready payloads.
+      try {
+        if (sequence === null || !env.crypto || !env.crypto.subtle || typeof requestID !== "string") return;
+        Promise.resolve(env.crypto.subtle.digest("SHA-256", new env.TextEncoder().encode(requestID)))
+          .then((bytes) => {
+            try {
+              const hash = Array.from(new Uint8Array(bytes).slice(0, 12)).map((v) => v.toString(16).padStart(2, "0")).join("");
+              record("receiver_ready_correlation", { requestHash: hash, readySequence: sequence });
+            } catch (_) {}
+          }).catch(() => {});
+      } catch (_) {}
+    }
+    function optionsSnapshot(options) {
+      try {
+        const idle = options.disableIdleTimeout, inactivity = options.maxInactivity;
+        record("receiver_caf_options_snapshot", { idleTimeoutOption: typeof idle === "boolean" ? String(idle) : "DEFAULT",
+          maxInactivityOption: inactivity === undefined ? "DEFAULT" : "EXPLICIT", maxInactivitySeconds: inactivity });
+      } catch (_) { record("receiver_diag_hook_unavailable", { phase: "CAF" }); }
+    }
+    return Object.freeze({ record, installGlobal, installCAF, readySent, optionsSnapshot,
+      mediaRequested() { mediaRequested = true; record("receiver_media_request_observed"); },
+      snapshot() { return records.slice(); }, diagnosticVersion: VERSION });
+  }
+  const lifecycleDiagnostics = createLifecycleDiagnostics(global, startupTiming.receiver_page_script_started);
+  try { lifecycleDiagnostics.installGlobal(); } catch (_) {}
+  try { global.ScreenMirrorReceiverLifecycleDiagnostics = Object.freeze({
+    diagnosticVersion: lifecycleDiagnostics.diagnosticVersion, snapshot: () => lifecycleDiagnostics.snapshot() }); } catch (_) {}
+
   function boot() {
     ui = { panel: document.getElementById("idle-screen"), title: document.getElementById("status-title"), detail: document.getElementById("status-detail") };
     showScreen("ready");
@@ -1108,6 +1254,7 @@
     capabilityReadyPromise = testCapabilities(video);
     if (!global.cast || !global.cast.framework) { showScreen("lost"); return; }
     context = global.cast.framework.CastReceiverContext.getInstance();
+    lifecycleDiagnostics.installCAF(context, global.cast.framework);
     if (typeof context.addEventListener === "function") {
       const types = global.cast.framework.system.EventType;
       context.addEventListener(types.READY, () => recordReceiverStartup("receiver_caf_context_ready"));
@@ -1121,7 +1268,10 @@
     recordReceiverStartup("receiver_namespace_registered");
     const options = new global.cast.framework.CastReceiverOptions();
     options.customNamespaces = { [NAMESPACE]: global.cast.framework.system.MessageType.JSON };
+    lifecycleDiagnostics.optionsSnapshot(options);
+    lifecycleDiagnostics.record("receiver_caf_start_requested");
     context.start(options);
+    lifecycleDiagnostics.record("receiver_caf_start_returned");
 
   }
   global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ effectiveReceiverConfigHash, SCREEN_COPY, closeScreen, MIME_TYPE, AUDIO_MIME_TYPE, RESULT, validEndpoint, validateProbe, validateMediaStart, validateReadyQuery, makeReadyReport, receiverReadinessStateForScreen, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, makeLatencyStage, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createInitialAudioCreditDelivery, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
