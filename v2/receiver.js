@@ -48,6 +48,7 @@
   let receiverReadinessState = "ready";
   let capabilities = Object.freeze({ webSocketAPI: false, mediaSource: false, avcMIME: false, sourceBuffer: false, autoplay: "deferred", websocketAttempted: false, websocketAuthenticated: false, probeAckStatus: "not_attempted", terminalStatus: "capability_partial", websocketLifecycle: "not_attempted" });
   let capabilityProbe = Object.freeze({ avcMIMEOutcome: "not_tested", avcMIMEException: "none", sourceBufferOutcome: "not_tested", sourceBufferException: "none" });
+  const capabilityProbeTrace = { settled: "not_started", sourceOpen: "not_seen", addSourceBuffer: "not_attempted", sourceStateAtTimeout: "na", source: null, sourceOpenDelayMs: -1 };
   let capabilityReadyPromise = Promise.resolve(capabilities);
 
   function byteLength(value) { return new TextEncoder().encode(value).length; }
@@ -114,15 +115,26 @@
     const message = typeof error.message === "string" ? error.message : "";
     return `${name}_${message}`.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "").slice(0, 64) || "error";
   }
+  function safeMediaSourceState(source) {
+    try { return source && ["closed", "open", "ended"].includes(source.readyState) ? source.readyState : "unknown"; }
+    catch (_) { return "unknown"; }
+  }
   function capabilityDiagnosticResults() {
     const bool = (value) => value ? "true" : "false";
-    return [
+    const openDelay = capabilityProbeTrace.sourceOpenDelayMs < 0 ? "na" : capabilityProbeTrace.sourceOpenDelayMs;
+    const results = [
       `receiver_capability_websocket_${bool(capabilities.webSocketAPI)}_mediasource_${bool(capabilities.mediaSource)}_avcmime_${bool(capabilities.avcMIME)}_sourcebuffer_${bool(capabilities.sourceBuffer)}`,
       "receiver_capability_probe_protocol_2_mime_avc1_42e01f",
       `receiver_capability_avcmime_outcome_${capabilityProbe.avcMIMEOutcome}_exception_${capabilityProbe.avcMIMEException}`,
-      `receiver_capability_sourcebuffer_outcome_${capabilityProbe.sourceBufferOutcome}_exception_${capabilityProbe.sourceBufferException}`,
-      "receiver_capability_revision_corr_fragseq_20260922_capability_snapshot"
+      `receiver_capability_sourcebuffer_outcome_${capabilityProbe.sourceBufferOutcome}_exception_${capabilityProbe.sourceBufferException}`
     ];
+    if (capabilityProbeTrace.settled !== "not_started") results.push(
+      `receiver_capability_probe_settled_${capabilityProbeTrace.settled}_sourceopen_${capabilityProbeTrace.sourceOpen}`,
+      `receiver_capability_probe_addbuffer_${capabilityProbeTrace.addSourceBuffer}_open_delay_ms_${openDelay}`,
+      `receiver_capability_probe_source_state_timeout_${capabilityProbeTrace.sourceStateAtTimeout}_at_media_${safeMediaSourceState(capabilityProbeTrace.source)}`
+    );
+    results.push("receiver_capability_revision_corr_fragseq_20260922_capability_snapshot");
+    return results;
   }
   function sendCapabilityDiagnostics(event, request) {
     for (const result of capabilityDiagnosticResults()) sendMediaResult(event.senderId, request.requestId, result);
@@ -884,16 +896,41 @@
       catch (error) { avcMIMEException = safeException(error); }
     }
     const sourceBufferReady = new Promise((resolve) => {
-      if (!result.avcMIME) { resolve(false); return; }
+      if (!result.avcMIME) { capabilityProbeTrace.settled = "avc_unsupported"; resolve(false); return; }
+      const startedAt = receiverNow();
+      let timedOut = false;
       try {
         const source = new global.MediaSource();
+        capabilityProbeTrace.source = source;
         video.src = global.URL.createObjectURL(source);
-        const timeout = global.setTimeout(() => resolve({ value: false, exception: "timeout" }), 1500);
+        const timeout = global.setTimeout(() => {
+          timedOut = true;
+          capabilityProbeTrace.settled = "timeout_before_sourceopen";
+          capabilityProbeTrace.sourceStateAtTimeout = safeMediaSourceState(source);
+          resolve({ value: false, exception: "timeout" });
+        }, 1500);
         source.addEventListener("sourceopen", () => {
           global.clearTimeout(timeout);
-          try { resolve({ value: !!source.addSourceBuffer(MIME_TYPE), exception: "none" }); } catch (error) { resolve({ value: false, exception: safeException(error) }); }
+          capabilityProbeTrace.sourceOpen = timedOut ? "after_timeout" : "before_timeout";
+          const observedAt = receiverNow();
+          const delay = Number.isFinite(startedAt) && Number.isFinite(observedAt) ? observedAt - startedAt : -1;
+          capabilityProbeTrace.sourceOpenDelayMs = Number.isFinite(delay) && delay >= 0 ? Math.min(60000, Math.round(delay)) : -1;
+          capabilityProbeTrace.addSourceBuffer = "attempted";
+          try {
+            const added = !!source.addSourceBuffer(MIME_TYPE);
+            capabilityProbeTrace.addSourceBuffer = added ? "succeeded" : "returned_false";
+            if (!timedOut) capabilityProbeTrace.settled = added ? "sourcebuffer_created" : "sourcebuffer_unavailable";
+            resolve({ value: added, exception: "none" });
+          } catch (error) {
+            capabilityProbeTrace.addSourceBuffer = "threw";
+            if (!timedOut) capabilityProbeTrace.settled = "sourcebuffer_exception";
+            resolve({ value: false, exception: safeException(error) });
+          }
         }, { once: true });
-      } catch (error) { resolve({ value: false, exception: safeException(error) }); }
+      } catch (error) {
+        capabilityProbeTrace.settled = capabilityProbeTrace.source ? "attach_exception" : "constructor_exception";
+        resolve({ value: false, exception: safeException(error) });
+      }
     });
     return sourceBufferReady.then((sourceBufferProbe) => {
       const sourceBuffer = typeof sourceBufferProbe === "boolean" ? sourceBufferProbe : sourceBufferProbe.value;
