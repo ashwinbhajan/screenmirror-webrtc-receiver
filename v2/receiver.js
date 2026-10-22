@@ -1,7 +1,7 @@
 (function receiverCapabilityGate(global) {
   "use strict";
 
-  const RECEIVER_VERSION = "2.0.1";
+  const RECEIVER_VERSION = "2.0.0";
   const RECEIVER_REVISION = "corr-fragseq-20261010-ready-brand-01";
   const PROTOCOL_VERSION = 2;
   const NAMESPACE = "urn:x-cast:com.ashwinbhajan.screenmirror.cmafprobe.v2";
@@ -26,7 +26,6 @@
   const senderConnections = new Map();
   let activeReceiverPagehideListener = null;
   let activeMediaRun = 0;
-  let mediaStopProof = null;
   const receiverNow = () => global.performance && typeof global.performance.now === "function" ? global.performance.now() : null;
   startupTiming.receiver_page_script_started = Number.isFinite(global.__screenMirrorPageScriptStarted)
     ? global.__screenMirrorPageScriptStarted : receiverNow();
@@ -403,7 +402,6 @@
   }
   function runMedia(event, request) {
     const mediaRun = ++activeMediaRun;
-    mediaStopProof = null;
     sendCapabilityDiagnostics(event, request);
     if (!capabilityResult()) {
       sendReceiverDiagnostic(event, request, "receiver_error_before_disconnect_unsupported");
@@ -436,7 +434,6 @@
       global.addEventListener("pagehide", activeReceiverPagehideListener, { once: true });
     }
     let reconnectingScreenTimer;
-    let normalStopReceived = false;
     let latencyFallback = false; let frameCallbackID;
     // Preserve the existing timeupdate fallback on receivers without rVFC.
     const latencyCorrelations = new Map();
@@ -474,18 +471,6 @@
     const observeFrame = (now, metadata) => {
       if (receiverStopped) return;
       confirmFirstRendered(metadata);
-      // Rendered frames are progress even when timeupdate is delayed or throttled.
-      if (Number.isFinite(metadata.mediaTime) && metadata.mediaTime > lastPlayback.time + 0.01) {
-        lastPlayback.time = metadata.mediaTime;
-        lastPlayback.advancedAt = now;
-        clearReconnectingScreenTimer();
-        if (lastPlayback.recoveryAwaitingProgress) {
-          lastPlayback.recoveryAwaitingProgress = false;
-          clearRecoveryTimeout();
-          sendOptionalMediaDiagnostic(event.senderId, request.requestId, "receiver_playback_recovered");
-        }
-        if (firstRendered && !receiverStopped && mediaRun === activeMediaRun && !ui.panel.hidden) showScreen("playing");
-      }
       pacing.frame(now, metadata);
       correlations.frame(now, { ...metadata, bufferLeadMs: Math.round(bufferedLead(video) * 1000) });
     };
@@ -513,10 +498,10 @@
         }
       } catch (_) { /* Diagnostic console failure cannot change Stop. */ }
     };
-    const dispatchStopAcknowledgement = (result, targetSenderId = event.senderId) => {
+    const dispatchStopAcknowledgement = (result) => {
       logStopAcknowledgement("dispatch_attempt", { result });
       try {
-        const returned = sendMediaResult(targetSenderId, request.requestId, result);
+        const returned = sendMediaResult(event.senderId, request.requestId, result);
         logStopAcknowledgement("dispatch_returned", { result, returnType: typeof returned });
         return returned;
       } catch (error) {
@@ -525,21 +510,6 @@
         return false;
       }
     };
-    // A readback can arrive before normalStop over the independent media socket.
-    // Keep one pending recipient; querying never stops media or manufactures proof.
-    const stopProof = { senderId: event.senderId, requestId: request.requestId, mediaRun,
-      ready: false, replayed: false, pendingSenderId: null,
-      replay(targetSenderId) {
-        dispatchStopAcknowledgement(targetSenderId === event.senderId ? "receiver_stop_readback_same_sender" : "receiver_stop_readback_after_sender_change", targetSenderId);
-        for (const result of ["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown"]) dispatchStopAcknowledgement(result, targetSenderId);
-      },
-      readback(targetSenderId) {
-        if (this.replayed) return;
-        this.pendingSenderId = targetSenderId;
-        if (this.ready) { this.replayed = true; this.pendingSenderId = null; this.replay(targetSenderId); }
-      }
-    };
-    mediaStopProof = stopProof;
     const scheduleReconnectingScreen = () => {
       if (receiverStopped || !firstRendered || reconnectingScreenTimer) return;
       reconnectingScreenTimer = global.setTimeout(() => {
@@ -563,10 +533,6 @@
       document.body.classList.remove("media-active");
       document.body.classList.add("receiver-idle");
       showScreen(screen);
-      if (screen === "stopped" && normalStopReceived && mediaRun === activeMediaRun && mediaStopProof === stopProof) {
-        stopProof.ready = true;
-        if (stopProof.pendingSenderId) stopProof.readback(stopProof.pendingSenderId);
-      }
       logStopAcknowledgement("screen_transition", { screen });
       dispatchStopAcknowledgement("receiver_video_cleared");
       dispatchStopAcknowledgement("receiver_idle_screen_shown");
@@ -845,7 +811,6 @@
                 return;
               }
               if (control.type === "normalStop" && control.protocolVersion === PROTOCOL_VERSION && Object.keys(control).length === 2) {
-                normalStopReceived = true;
                 logStopAcknowledgement("normal_stop_received", { controlType: control.type, controlProtocolVersion: control.protocolVersion });
                 dispatchStopAcknowledgement("receiver_stop_received");
                 clearVideoForReceiverStop("stopped");
@@ -898,6 +863,7 @@
             if (!receiverStopped) {
               const code = closeEvent && Number.isInteger(closeEvent.code) ? closeEvent.code : 0;
               logStopAcknowledgement("socket_closed_without_prior_stop", { closeCode: code, wasClean: !!(closeEvent && closeEvent.wasClean) });
+              dispatchStopAcknowledgement("receiver_stop_received");
               clearVideoForReceiverStop(closeScreen(closeEvent, socketFailed));
             }
             if (!firstRendered) {
@@ -996,18 +962,6 @@
   function receiverMessage(event) {
     const readyQuery = event && validateReadyQuery(event.data);
     if (readyQuery) {
-      const proof = mediaStopProof;
-      let readbackSenderMatches = proof && event.senderId === proof.senderId;
-      try {
-        if (proof && !readbackSenderMatches && typeof context.getSender === "function") {
-          readbackSenderMatches = !!context.getSender(event.senderId) && !context.getSender(proof.senderId);
-        }
-      } catch (_) { readbackSenderMatches = false; }
-      if (proof && readyQuery.requestId === `stop_${proof.requestId}` && readbackSenderMatches
-          && proof.mediaRun === activeMediaRun) {
-        proof.readback(event.senderId);
-        return;
-      }
       capabilityReadyPromise.then((runtime) => {
         const audioSupported = !!(runtime && runtime.mediaSource) && global.MediaSource.isTypeSupported(AUDIO_MIME_TYPE) === true;
         if (event.senderId) {
