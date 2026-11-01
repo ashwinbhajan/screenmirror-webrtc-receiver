@@ -1275,6 +1275,9 @@
     recordReceiverStartup("receiver_namespace_registered");
     const options = new global.cast.framework.CastReceiverOptions();
     options.customNamespaces = { [NAMESPACE]: global.cast.framework.system.MessageType.JSON };
+    // This receiver streams raw MSE video over its own namespace and never loads a CAF
+    // media session, so CAF's default no-media idle shutdown (~300s) must be disabled here.
+    options.disableIdleTimeout = true;
     lifecycleDiagnostics.optionsSnapshot(options);
     lifecycleDiagnostics.record("receiver_caf_start_requested");
     context.start(options);
