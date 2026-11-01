@@ -794,8 +794,28 @@
             if (lastAppendingType === 2 && mediaAppendPending) sendOptionalMediaDiagnostic(event.senderId, request.requestId, "media_append_abort_event");
             stop("append_aborted");
           });
-          socket = new global.WebSocket(request.endpoint); socket.binaryType = "arraybuffer";
+          sendReceiverDiagnostic(event, request, "receiver_endpoint_connect_attempted");
+          try {
+            socket = new global.WebSocket(request.endpoint);
+          } catch (constructorError) {
+            // A page served over https: may have this throw synchronously
+            // (mixed-content / Private Network Access rejection) before any
+            // onerror/onopen ever fires, which previously left the sender
+            // waiting silently for a first-rendered-frame that could never
+            // arrive. This is additive diagnostics only, not a transport fix.
+            sendReceiverDiagnostic(event, request,
+              `receiver_endpoint_websocket_constructor_threw_${(constructorError && constructorError.name) || "unknown"}`);
+            stop("websocket_failed");
+            return;
+          }
+          socket.binaryType = "arraybuffer";
+          let socketOpened = false;
+          const socketConnectTimeout = global.setTimeout(() => {
+            if (!socketOpened) sendReceiverDiagnostic(event, request, "receiver_endpoint_connect_timeout");
+          }, 8000);
           socket.onopen = () => {
+            socketOpened = true;
+            global.clearTimeout(socketConnectTimeout);
             sendReceiverDiagnostic(event, request, "receiver_endpoint_fetch_started");
             socket.send(JSON.stringify({ type: "hello", token: new URL(request.endpoint).pathname.slice(1), protocolVersion: PROTOCOL_VERSION }));
             installFrameObserver();
@@ -852,12 +872,14 @@
           let socketFailed = false;
           socket.onerror = () => {
             socketFailed = true;
+            global.clearTimeout(socketConnectTimeout);
             if (!firstRendered) {
               sendReceiverDiagnostic(event, request, "receiver_endpoint_fetch_failed");
               sendReceiverDiagnostic(event, request, "receiver_error_before_disconnect_websocket_error");
             }
             stop("websocket_failed");
           }; socket.onclose = (closeEvent) => {
+            global.clearTimeout(socketConnectTimeout);
             mediaAuthenticated = false;
             initialAudioCredits.close();
             if (!receiverStopped) {
