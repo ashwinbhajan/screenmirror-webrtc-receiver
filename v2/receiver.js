@@ -633,6 +633,20 @@
       audioTrimPending = false;
       initialAudioCredits.close();
       mediaAuthenticated = false;
+      // Explicitly release this generation's SourceBuffers (and the audio
+      // decoder behind audioBuffer in particular) before detaching src, rather
+      // than only relying on garbage collection once these locals go out of
+      // scope. On rapid back-to-back casts the next generation's addSourceBuffer
+      // call for audio can otherwise run before the platform has freed the
+      // previous decoder instance, which throws and silently degrades to
+      // video-only.
+      try {
+        if (source && source.readyState === "open") {
+          if (audioBuffer && !audioBuffer.updating) { try { source.removeSourceBuffer(audioBuffer); } catch (_) {} }
+          if (buffer && !buffer.updating) { try { source.removeSourceBuffer(buffer); } catch (_) {} }
+        }
+      } catch (_) {}
+      audioBuffer = null; buffer = null;
       try { video.pause(); video.removeAttribute("src"); video.load(); } catch (_) {}
       document.body.classList.remove("media-active");
       document.body.classList.add("receiver-idle");
@@ -912,14 +926,20 @@
               audioBuffer = null;
               if (attemptsLeft > 0) {
                 sendMediaResult(event.senderId, request.requestId, "receiver_audio_source_buffer_retry_scheduled");
-                global.setTimeout(() => attachAudioBuffer(attemptsLeft - 1), 300);
+                // Back-to-back casts can be seconds apart or milliseconds apart;
+                // a single short retry isn't enough for the previous generation's
+                // audio decoder to release on a very fast cycle, so this backs
+                // off across several attempts (400/800/1600/2400ms) before
+                // accepting that this generation will be video-only.
+                const delayMs = [400, 800, 1600, 2400][4 - attemptsLeft] || 2400;
+                global.setTimeout(() => attachAudioBuffer(attemptsLeft - 1), delayMs);
                 return;
               }
               sendMediaResult(event.senderId, request.requestId, "receiver_audio_unsupported_video_continues");
             }
           };
           if (audioRequested && global.MediaSource.isTypeSupported(AUDIO_MIME_TYPE) === true) {
-            attachAudioBuffer(1);
+            attachAudioBuffer(4);
           }
           buffer.addEventListener("updateend", () => {
             if (receiverStopped || mediaRun !== activeMediaRun) return;
