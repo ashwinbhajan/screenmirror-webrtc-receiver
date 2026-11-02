@@ -2,7 +2,7 @@
   "use strict";
 
   const RECEIVER_VERSION = "2.0.0";
-  const RECEIVER_REVISION = "lost-ready-20261102-01";
+  const RECEIVER_REVISION = "audio-retry-20261102-01";
   const PROTOCOL_VERSION = 2;
   const NAMESPACE = "urn:x-cast:com.ashwinbhajan.screenmirror.cmafprobe.v2";
   const MIME_TYPE = 'video/mp4; codecs="avc1.42e01f"';
@@ -879,7 +879,14 @@
         try {
           buffer = source.addSourceBuffer(MIME_TYPE);
           sendMediaResult(event.senderId, request.requestId, "source_buffer_created");
-          if (audioRequested && global.MediaSource.isTypeSupported(AUDIO_MIME_TYPE) === true) {
+          // Rapid successive stop/start cycles can ask the platform to create a
+          // new audio decoder instance before the previous generation's one has
+          // finished releasing (observed as addSourceBuffer throwing here on a
+          // device that has just been through back-to-back broadcasts). That is
+          // a transient resource race, not "this device can't play AAC", so one
+          // short-delay retry is attempted before degrading to video-only.
+          const attachAudioBuffer = (attemptsLeft) => {
+            if (receiverStopped || mediaRun !== activeMediaRun || source.readyState !== "open") return;
             try {
               audioBuffer = source.addSourceBuffer(AUDIO_MIME_TYPE);
               sendMediaResult(event.senderId, request.requestId, "receiver_audio_source_buffer_created");
@@ -903,8 +910,16 @@
               });
             } catch (_) {
               audioBuffer = null;
+              if (attemptsLeft > 0) {
+                sendMediaResult(event.senderId, request.requestId, "receiver_audio_source_buffer_retry_scheduled");
+                global.setTimeout(() => attachAudioBuffer(attemptsLeft - 1), 300);
+                return;
+              }
               sendMediaResult(event.senderId, request.requestId, "receiver_audio_unsupported_video_continues");
             }
+          };
+          if (audioRequested && global.MediaSource.isTypeSupported(AUDIO_MIME_TYPE) === true) {
+            attachAudioBuffer(1);
           }
           buffer.addEventListener("updateend", () => {
             if (receiverStopped || mediaRun !== activeMediaRun) return;
