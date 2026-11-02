@@ -2,7 +2,7 @@
   "use strict";
 
   const RECEIVER_VERSION = "2.0.0";
-  const RECEIVER_REVISION = "audio-retry-20261102-02";
+  const RECEIVER_REVISION = "audio-retry-20261102-03";
   const PROTOCOL_VERSION = 2;
   const NAMESPACE = "urn:x-cast:com.ashwinbhajan.screenmirror.cmafprobe.v2";
   const MIME_TYPE = 'video/mp4; codecs="avc1.42e01f"';
@@ -922,24 +922,27 @@
               audioBuffer.addEventListener("error", () => {
                 degradeAudio("receiver_audio_error_video_continues");
               });
-            } catch (_) {
+            } catch (error) {
               audioBuffer = null;
+              const reason = (error && error.name) ? error.name : "unknown_error";
               if (attemptsLeft > 0) {
-                sendMediaResult(event.senderId, request.requestId, "receiver_audio_source_buffer_retry_scheduled");
+                sendMediaResult(event.senderId, request.requestId, `receiver_audio_source_buffer_retry_scheduled_${reason}`);
                 // Back-to-back casts can be seconds apart or milliseconds apart;
-                // a single short retry isn't enough for the previous generation's
-                // audio decoder to release on a very fast cycle, so this backs
-                // off across several attempts (400/800/1600/2400ms) before
-                // accepting that this generation will be video-only.
-                const delayMs = [400, 800, 1600, 2400][4 - attemptsLeft] || 2400;
+                // a device that has just been through many rapid cycles can need
+                // much longer than a few seconds to release the previous
+                // generation's audio decoder, so this backs off across several
+                // attempts, totalling ~24s, before accepting video-only.
+                const delayMs = [400, 800, 1600, 3200, 5000, 7000][6 - attemptsLeft] || 7000;
                 global.setTimeout(() => attachAudioBuffer(attemptsLeft - 1), delayMs);
                 return;
               }
-              sendMediaResult(event.senderId, request.requestId, "receiver_audio_unsupported_video_continues");
+              sendMediaResult(event.senderId, request.requestId, `receiver_audio_unsupported_video_continues_${reason}`);
             }
           };
           if (audioRequested && global.MediaSource.isTypeSupported(AUDIO_MIME_TYPE) === true) {
-            attachAudioBuffer(4);
+            attachAudioBuffer(6);
+          } else if (audioRequested) {
+            sendMediaResult(event.senderId, request.requestId, "receiver_audio_skipped_codec_unsupported");
           }
           buffer.addEventListener("updateend", () => {
             if (receiverStopped || mediaRun !== activeMediaRun) return;
