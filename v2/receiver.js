@@ -2,7 +2,7 @@
   "use strict";
 
   const RECEIVER_VERSION = "2.0.0";
-  const RECEIVER_REVISION = "corr-fragseq-20261010-ready-brand-01";
+  const RECEIVER_REVISION = "lost-ready-20261102-01";
   const PROTOCOL_VERSION = 2;
   const NAMESPACE = "urn:x-cast:com.ashwinbhajan.screenmirror.cmafprobe.v2";
   const MIME_TYPE = 'video/mp4; codecs="avc1.42e01f"';
@@ -13,6 +13,12 @@
   const LIVE_EDGE_FAST_THRESHOLD_SECONDS = 1.25;
   const LIVE_EDGE_NORMAL_THRESHOLD_SECONDS = 0.75;
   const LIVE_EDGE_FAST_PLAYBACK_RATE = 1.2;
+  const HEALTHY_CATCHUP_TRIGGER_SECONDS = 6;
+  const HEALTHY_CATCHUP_REARM_SECONDS = 3;
+  const HEALTHY_CATCHUP_MARGIN_SECONDS = 1;
+  const HEALTHY_CATCHUP_MIN_JUMP_SECONDS = 2;
+  const HEALTHY_CATCHUP_PERSIST_MS = 2500;
+  const HEALTHY_CATCHUP_COOLDOWN_MS = 10000;
   const REQUEST_ID = /^[A-Za-z0-9._-]{1,64}$/;
   const RESULT = Object.freeze({
     PASS: "capability_pass",
@@ -46,7 +52,9 @@
 
   let context;
   let ui;
-  const receiverReadinessStateForScreen = (screen) => screen === "playing" ? "mirroring" : (screen === "lost" ? "unavailable" : "ready");
+  // "lost" means the TV is showing "Connection Lost / Waiting for iPhone" — it IS ready for a
+  // new sender to reconnect. Only "playing" (someone actively mirroring) blocks a new session.
+  const receiverReadinessStateForScreen = (screen) => screen === "playing" ? "mirroring" : "ready";
   let receiverReadinessState = "ready";
   let capabilities = Object.freeze({ webSocketAPI: false, mediaSource: false, avcMIME: false, sourceBuffer: false, autoplay: "deferred", websocketAttempted: false, websocketAuthenticated: false, probeAckStatus: "not_attempted", terminalStatus: "capability_partial", websocketLifecycle: "not_attempted" });
   let capabilityProbe = Object.freeze({ avcMIMEOutcome: "not_tested", avcMIMEException: "none", sourceBufferOutcome: "not_tested", sourceBufferException: "none" });
@@ -141,7 +149,7 @@
     return results;
   }
   function sendCapabilityDiagnostics(event, request) {
-    for (const result of capabilityDiagnosticResults()) sendOptionalMediaDiagnostic(event.senderId, request.requestId, result);
+    for (const result of capabilityDiagnosticResults()) sendMediaResult(event.senderId, request.requestId, result);
   }
   function recoverySeekTarget(currentTime, start, end) {
     if (!Number.isFinite(currentTime) || !Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
@@ -166,11 +174,95 @@
     if (currentRate > 1 && lead <= LIVE_EDGE_NORMAL_THRESHOLD_SECONDS) return 1;
     return null;
   }
+  function readBufferedRanges(ranges) {
+    const result = [];
+    try {
+      for (let i = 0; ranges && i < Math.min(ranges.length, 8); i += 1) {
+        const start = ranges.start(i); const end = ranges.end(i);
+        if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return [];
+        result.push({ start, end });
+      }
+    } catch (_) { return []; }
+    return result;
+  }
+  function containingRange(ranges, position) {
+    if (!Number.isFinite(position)) return null;
+    return ranges.find((range) => range.start <= position && position < range.end) || null;
+  }
+  // An appended sync sample, rather than an arbitrary buffered time, is the
+  // only eligible healthy catch-up destination. The same media element seeks
+  // both tracks; AAC additionally requires one continuous common range.
+  function createHealthyLiveEdgeCatchup(runID) {
+    let highSince = null; let lastSeekAt = -Infinity; let armed = true; let seekPending = false; let closed = false;
+    return {
+      consider(sample) {
+        if (closed || sample.runID !== runID) return null;
+        const now = sample.nowMs;
+        const videoRange = containingRange(sample.videoRanges || [], sample.currentTime);
+        const audioRange = sample.audioRequested ? containingRange(sample.audioRanges || [], sample.currentTime) : null;
+        const healthy = Number.isFinite(now) && videoRange && sample.readyState >= 3 && !sample.paused
+          && !sample.ended && !sample.seeking && !sample.mediaError && sample.sourceOpen
+          && !sample.videoUpdating && sample.pendingDepth <= 1 && sample.progressAgeMs <= 750
+          && sample.appendAgeMs <= 1000 && (sample.renderAgeMs === null || sample.renderAgeMs <= 750)
+          && (!sample.audioRequested || (sample.audioReady && audioRange && !sample.audioUpdating));
+        if (!healthy) { highSince = null; return null; }
+        const end = sample.audioRequested ? Math.min(videoRange.end, audioRange.end) : videoRange.end;
+        const lead = end - sample.currentTime;
+        if (lead <= HEALTHY_CATCHUP_REARM_SECONDS && !seekPending) armed = true;
+        if (lead < HEALTHY_CATCHUP_TRIGGER_SECONDS || !armed || seekPending) { highSince = null; return null; }
+        if (highSince === null) highSince = now;
+        if (now - highSince < HEALTHY_CATCHUP_PERSIST_MS || now - lastSeekAt < HEALTHY_CATCHUP_COOLDOWN_MS) return null;
+        const latest = end - HEALTHY_CATCHUP_MARGIN_SECONDS;
+        const candidates = (sample.syncPoints || []).filter((point) => Number.isFinite(point)
+          && point >= videoRange.start && point < videoRange.end
+          && (!sample.audioRequested || (point >= audioRange.start && point < audioRange.end))
+          && point <= latest && point - sample.currentTime >= HEALTHY_CATCHUP_MIN_JUMP_SECONDS);
+        const sync = candidates[candidates.length - 1];
+        if (sync === undefined) return null;
+        highSince = null; armed = false; seekPending = true; lastSeekAt = now;
+        return sync;
+      },
+      completeSeek(run) { if (!closed && run === runID) seekPending = false; },
+      close() { closed = true; highSince = null; seekPending = false; }
+    };
+  }
   function makeLatencyStage(generation, sequence, stage, receiverTimeMs, bufferLeadMs, pendingDepth) {
     if (!Number.isInteger(generation) || generation <= 0 || !Number.isInteger(sequence) || sequence <= 0 ||
         !["received", "append_started", "append_ended"].includes(stage) || !Number.isFinite(receiverTimeMs) || receiverTimeMs < 0 ||
         !Number.isFinite(bufferLeadMs) || bufferLeadMs < 0 || !Number.isInteger(pendingDepth) || pendingDepth < 0 || pendingDepth > 8) return null;
     return { type: "latencyStage", generation, sequence, stage, receiverTimeMs, bufferLeadMs, pendingDepth };
+  }
+  function makePeriodicPlaybackSample(video, buffer, metrics) {
+    const boundedMs = (seconds) => Number.isFinite(seconds) && seconds >= 0 ? Math.min(3600000, Math.round(seconds * 1000)) : -1;
+    const endMs = (ranges) => {
+      try { return ranges && ranges.length ? boundedMs(ranges.end(ranges.length - 1)) : -1; }
+      catch (_) { return -1; }
+    };
+    let quality;
+    try { quality = typeof video.getVideoPlaybackQuality === "function" ? video.getVideoPlaybackQuality() : null; } catch (_) { quality = null; }
+    const count = (value) => Number.isFinite(value) && value >= 0 ? Math.min(1000000, Math.floor(value)) : -1;
+    const currentTimeMs = boundedMs(video.currentTime);
+    const sourceEndMs = endMs(buffer && buffer.buffered);
+    return {
+      type: "stats", protocolVersion: PROTOCOL_VERSION, generation: metrics.generation,
+      sampleIndex: metrics.sampleIndex, receiverTimeMs: Math.max(0, Math.round(metrics.nowMs)),
+      currentTimeMs, bufferedEndMs: endMs(video.buffered), sourceEndMs,
+      liveEdgeMs: sourceEndMs < 0 || currentTimeMs < 0 ? -1 : Math.max(-60000, Math.min(60000, sourceEndMs - currentTimeMs)),
+      readyState: Math.max(0, Math.min(4, video.readyState || 0)), paused: !!video.paused,
+      playbackRateMilli: Math.max(0, Math.min(4000, Math.round((video.playbackRate || 0) * 1000))),
+      sourceUpdating: !!(buffer && buffer.updating), queueDepth: Math.max(0, Math.min(8, metrics.queueDepth)),
+      receiverDrops: count(metrics.receiverDrops), appendedFragments: count(metrics.appendedFragments),
+      renderedCallbacks: count(metrics.renderedCallbacks), presentedFrames: count(metrics.presentedFrames),
+      totalVideoFrames: count(quality && quality.totalVideoFrames), droppedFrames: count(quality && quality.droppedVideoFrames),
+      uncorrelatedFrames: count(metrics.uncorrelatedFrames),
+      lastAppendAgeMs: metrics.lastAppendAtMs === null ? -1 : Math.max(0, Math.min(60000, Math.round(metrics.nowMs - metrics.lastAppendAtMs))),
+      lastRenderAgeMs: metrics.lastRenderAtMs === null ? -1 : Math.max(0, Math.min(60000, Math.round(metrics.nowMs - metrics.lastRenderAtMs))),
+      renderedMediaTimeMs: boundedMs(metrics.renderedMediaTime),
+      decodeDurationMs: Math.min(60000, boundedMs(metrics.decodeDuration)),
+      displayLeadMs: Math.min(60000, boundedMs(metrics.displayLead)),
+      seekCount: count(metrics.seekCount), lastSeekKind: metrics.lastSeekKind,
+      rateChanges: count(metrics.rateChanges)
+    };
   }
   function canConfirmFirstRendered(firstRendered, firstMediaAppended, metadata) {
     return !firstRendered && firstMediaAppended && Number.isFinite(metadata && metadata.presentedFrames) && metadata.presentedFrames > 0;
@@ -347,15 +439,9 @@
     if (telemetry) payload.telemetry = telemetry;
     context.sendCustomMessage(NAMESPACE, senderId, payload);
   }
-  function sendOptionalMediaDiagnostic(senderId, requestId, result, telemetry, observedReceiverTime) {
-    try { sendMediaResult(senderId, requestId, result, telemetry, observedReceiverTime); }
-    catch (_) { /* Optional diagnostics cannot interrupt media or cleanup. */ }
-  }
   function sendReceiverDiagnostic(event, request, result) {
     if (!event || !event.senderId || !request || typeof request.requestId !== "string") return;
-    const required = ["receiver_first_message_received", "receiver_auth_validation_passed", "receiver_media_ready_received"].includes(result);
-    if (required) sendMediaResult(event.senderId, request.requestId, result);
-    else sendOptionalMediaDiagnostic(event.senderId, request.requestId, result);
+    sendMediaResult(event.senderId, request.requestId, result);
   }
   function createMediaCreditEmitter(generation, send) {
     let creditSequence = 0;
@@ -402,6 +488,7 @@
   }
   function runMedia(event, request) {
     const mediaRun = ++activeMediaRun;
+    const healthyCatchup = createHealthyLiveEdgeCatchup(mediaRun);
     sendCapabilityDiagnostics(event, request);
     if (!capabilityResult()) {
       sendReceiverDiagnostic(event, request, "receiver_error_before_disconnect_unsupported");
@@ -420,13 +507,17 @@
     const audioPending = []; const maxAudioPending = 4;
     const flowGeneration = 1; const initialCredits = 8; let mediaReadySent = false;
     let mediaAuthenticated = false; let audioInitAppended = false;
-    let source; let buffer; let audioBuffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let lastAppendingFragment = null; let firstRendered = false; let playAttempted = false; let initialSeekRequested = false; let initialSeekCompleted = false; let recoverySeekPending = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let lastAudioType = 0; let audioCreditSequence = 0; let playTimeout; let receiverStopped = false; let stallThresholdMs = 1500; let recoveryTailSeconds = 0.05; let recoveryMinimumLeadSeconds = 0.05; let recoveryTimeoutMs = 3000; let lastPlayback = { time: 0, advancedAt: performance.now(), recoveryAwaitingProgress: false, recoveryTimeout: undefined };
+    let playbackSampleTimer; let playbackSamples = 0; let renderedCallbacks = 0; let presentedFrames = 0;
+    let lastAppendAtMs = null; let lastRenderAtMs = null; let renderedMediaTime = NaN;
+    let decodeDuration = NaN; let displayLead = NaN; let receiverDrops = 0;
+    let seekCount = 0; let lastSeekKind = 0; let rateChanges = 0;
+    let source; let buffer; let audioBuffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let lastAppendingFragment = null; let lastAppendingSyncTimes = []; const syncPoints = []; let firstRendered = false; let playAttempted = false; let initialSeekRequested = false; let initialSeekCompleted = false; let recoverySeekPending = false; let healthySeekPending = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let lastAudioType = 0; let audioTrimPending = false; let audioCreditSequence = 0; let playTimeout; let receiverStopped = false; let stallThresholdMs = 1500; let recoveryTailSeconds = 0.05; let recoveryMinimumLeadSeconds = 0.05; let recoveryTimeoutMs = 3000; let lastPlayback = { time: 0, advancedAt: performance.now(), recoveryAwaitingProgress: false, recoveryTimeout: undefined };
     if (activeReceiverPagehideListener && typeof global.removeEventListener === "function") {
       global.removeEventListener("pagehide", activeReceiverPagehideListener);
     }
     activeReceiverPagehideListener = () => {
       try {
-        sendOptionalMediaDiagnostic(event.senderId, request.requestId,
+        sendMediaResult(event.senderId, request.requestId,
           receiverStopped ? "receiver_document_pagehide_after_stop" : "receiver_document_pagehide_during_media");
       } catch (_) { /* Lifecycle diagnostics never affect receiver state. */ }
     };
@@ -464,13 +555,46 @@
       sendMediaResult(event.senderId, request.requestId, `first_frame_callback_presented_${presentedFrames}`);
       context.sendCustomMessage(NAMESPACE, event.senderId, { type: "firstRenderedFrame", protocolVersion: PROTOCOL_VERSION, requestId: request.requestId, receiverVersion: RECEIVER_VERSION, appendBacklogHighWatermark });
     };
-    const pacing = createFramePacingSummary((result) => sendOptionalMediaDiagnostic(event.senderId, request.requestId, result));
+    const pacing = createFramePacingSummary((result) => sendMediaResult(event.senderId, request.requestId, result));
     const correlations = createFrameCorrelationTracker(flowGeneration,
-      (result) => sendOptionalMediaDiagnostic(event.senderId, request.requestId, result), sendLatencyStage,
+      (result) => sendMediaResult(event.senderId, request.requestId, result), sendLatencyStage,
       (now, metadata, correlation) => sendLatency({ type: "renderedFrame", generation: correlation.generation, sequence: correlation.sequence, receiverTimeMs: now, mediaTimeMs: Math.round(metadata.mediaTime * 1000), presentedFrames: Number.isFinite(metadata.presentedFrames) ? metadata.presentedFrames : 0, bufferLeadMs: metadata.bufferLeadMs }));
+    const clearPlaybackSampleTimer = () => {
+      if (playbackSampleTimer !== undefined && typeof global.clearInterval === "function") global.clearInterval(playbackSampleTimer);
+      playbackSampleTimer = undefined;
+    };
+    const sendPeriodicPlaybackSample = () => {
+      if (receiverStopped || mediaRun !== activeMediaRun || !mediaAuthenticated || !socket || socket.readyState !== 1) {
+        clearPlaybackSampleTimer(); return;
+      }
+      if (playbackSamples >= 120) { clearPlaybackSampleTimer(); return; }
+      const nowMs = performance.now();
+      const sample = makePeriodicPlaybackSample(video, buffer, {
+        generation: flowGeneration, sampleIndex: playbackSamples + 1, nowMs,
+        queueDepth: pending.length, receiverDrops, appendedFragments, renderedCallbacks, presentedFrames,
+        uncorrelatedFrames: correlations.snapshot().counts.rendered_frame_uncorrelated_no_fragment_match || 0,
+        lastAppendAtMs, lastRenderAtMs, renderedMediaTime, decodeDuration, displayLead,
+        seekCount, lastSeekKind, rateChanges
+      });
+      if (sendLatency(sample)) playbackSamples += 1;
+    };
+    const startPlaybackSamples = () => {
+      if (playbackSampleTimer === undefined && typeof global.setInterval === "function") {
+        playbackSampleTimer = global.setInterval(sendPeriodicPlaybackSample, 5000);
+      }
+    };
     const observeFrame = (now, metadata) => {
       if (receiverStopped) return;
+      renderedCallbacks += 1;
+      lastRenderAtMs = now;
+      if (Number.isFinite(metadata.presentedFrames)) presentedFrames = metadata.presentedFrames;
+      renderedMediaTime = metadata.mediaTime;
+      decodeDuration = metadata.processingDuration;
+      displayLead = Number.isFinite(metadata.expectedDisplayTime) ? (metadata.expectedDisplayTime - now) / 1000 : NaN;
       confirmFirstRendered(metadata);
+      // A decoded frame can resume after MSE waiting without another
+      // "playing" event. Clear the overlay only on actual frame presentation.
+      if (firstRendered && ui && !ui.panel.hidden && !video.paused && !video.ended) showScreen("playing");
       pacing.frame(now, metadata);
       correlations.frame(now, { ...metadata, bufferLeadMs: Math.round(bufferedLead(video) * 1000) });
     };
@@ -485,31 +609,6 @@
     const clearPlayTimeout = () => { if (playTimeout) { global.clearTimeout(playTimeout); playTimeout = undefined; } };
     const clearRecoveryTimeout = () => { if (lastPlayback.recoveryTimeout) { global.clearTimeout(lastPlayback.recoveryTimeout); lastPlayback.recoveryTimeout = undefined; } };
     const clearReconnectingScreenTimer = () => { if (reconnectingScreenTimer) { global.clearTimeout(reconnectingScreenTimer); reconnectingScreenTimer = undefined; } };
-    // Stop-only console evidence. CAF exposes no delivery callback for
-    // sendCustomMessage, so a local return must never be called sender proof.
-    // Avoid logging sender/request identifiers or blocking Stop on DevTools.
-    const logStopAcknowledgement = (stage, fields = {}) => {
-      try {
-        if (global.console && typeof global.console.info === "function") {
-          global.console.info("ScreenMirror stop acknowledgement", {
-            stage, receiverTimeMs: receiverNow(), senderPresent: !!event.senderId,
-            requestPresent: typeof request.requestId === "string", ...fields
-          });
-        }
-      } catch (_) { /* Diagnostic console failure cannot change Stop. */ }
-    };
-    const dispatchStopAcknowledgement = (result) => {
-      logStopAcknowledgement("dispatch_attempt", { result });
-      try {
-        const returned = sendMediaResult(event.senderId, request.requestId, result);
-        logStopAcknowledgement("dispatch_returned", { result, returnType: typeof returned });
-        return returned;
-      } catch (error) {
-        logStopAcknowledgement("dispatch_threw", { result, exception: safeException(error) });
-        // Failed dispatch remains failed; it cannot prevent cleanup or later proof attempts.
-        return false;
-      }
-    };
     const scheduleReconnectingScreen = () => {
       if (receiverStopped || !firstRendered || reconnectingScreenTimer) return;
       reconnectingScreenTimer = global.setTimeout(() => {
@@ -520,26 +619,30 @@
     const clearVideoForReceiverStop = (screen) => {
       if (receiverStopped) return;
       receiverStopped = true;
+      healthyCatchup.close();
+      healthySeekPending = false;
+      recoverySeekPending = false;
       correlations.finish(performance.now());
       pacing.stop(correlations.snapshot().counts);
       if (frameCallbackID !== undefined && typeof video.cancelVideoFrameCallback === "function") video.cancelVideoFrameCallback(frameCallbackID);
       clearRecoveryTimeout();
       clearReconnectingScreenTimer();
+      clearPlaybackSampleTimer();
       pending.length = 0;
       audioPending.length = 0;
+      audioTrimPending = false;
       initialAudioCredits.close();
       mediaAuthenticated = false;
       try { video.pause(); video.removeAttribute("src"); video.load(); } catch (_) {}
       document.body.classList.remove("media-active");
       document.body.classList.add("receiver-idle");
       showScreen(screen);
-      logStopAcknowledgement("screen_transition", { screen });
-      dispatchStopAcknowledgement("receiver_video_cleared");
-      dispatchStopAcknowledgement("receiver_idle_screen_shown");
-      if (screen === "stopped") dispatchStopAcknowledgement("receiver_casting_stopped_screen_shown");
-      if (screen === "lost") dispatchStopAcknowledgement("receiver_connection_lost_screen_shown");
+      sendMediaResult(event.senderId, request.requestId, "receiver_video_cleared");
+      sendMediaResult(event.senderId, request.requestId, "receiver_idle_screen_shown");
+      if (screen === "stopped") sendMediaResult(event.senderId, request.requestId, "receiver_casting_stopped_screen_shown");
+      if (screen === "lost") sendMediaResult(event.senderId, request.requestId, "receiver_connection_lost_screen_shown");
     };
-    const stop = (result) => { clearInitAppendTimeout(); clearPlayTimeout(); try { socket && socket.close(); } catch (_) {} sendMediaResult(event.senderId, request.requestId, result); };
+    const stop = (result) => { clearInitAppendTimeout(); clearPlayTimeout(); clearPlaybackSampleTimer(); try { socket && socket.close(); } catch (_) {} sendMediaResult(event.senderId, request.requestId, result); };
     const safePlayRejection = (error) => {
       if (error && error.name === "NotAllowedError") return "play_rejected_not_allowed";
       if (error && error.name === "NotSupportedError") return "play_rejected_not_supported";
@@ -551,7 +654,7 @@
       const ranges = video.buffered;
       const hasRange = ranges && ranges.length > 0;
       const durationKind = Number.isNaN(video.duration) ? "nan" : video.duration === Infinity ? "infinite" : Number.isFinite(video.duration) ? "finite" : "unknown";
-      sendOptionalMediaDiagnostic(event.senderId, request.requestId, "playback_state", {
+      sendMediaResult(event.senderId, request.requestId, "playback_state", {
         checkpoint,
         readyState: Math.max(0, Math.min(4, video.readyState || 0)),
         networkState: Math.max(0, Math.min(3, video.networkState || 0)),
@@ -579,24 +682,24 @@
       if (playAttempted || !initialSeekCompleted || !firstKeyframe || !firstMediaAppended || !buffer || buffer.updating) return;
       playAttempted = true;
       playbackTelemetry("before_play");
-      sendOptionalMediaDiagnostic(event.senderId, request.requestId, "play_attempt_started");
+      sendMediaResult(event.senderId, request.requestId, "play_attempt_started");
       let promise;
-      try { promise = video.play(); } catch (_) { sendOptionalMediaDiagnostic(event.senderId, request.requestId, "play_synchronous_exception"); return; }
-      sendOptionalMediaDiagnostic(event.senderId, request.requestId, "play_promise_pending");
+      try { promise = video.play(); } catch (_) { sendMediaResult(event.senderId, request.requestId, "play_synchronous_exception"); return; }
+      sendMediaResult(event.senderId, request.requestId, "play_promise_pending");
       playTimeout = global.setTimeout(() => {
         playbackTelemetry("play_pending_timeout");
-        sendOptionalMediaDiagnostic(event.senderId, request.requestId, "play_pending_timeout");
+        sendMediaResult(event.senderId, request.requestId, "play_pending_timeout");
       }, 5000);
       Promise.resolve(promise).then(() => {
         clearPlayTimeout();
-        sendOptionalMediaDiagnostic(event.senderId, request.requestId, "play_promise_resolved");
+        sendMediaResult(event.senderId, request.requestId, "play_promise_resolved");
         if (!receiverStopped && audioRequested && audioBuffer) {
           video.muted = false;
-          sendOptionalMediaDiagnostic(event.senderId, request.requestId, "receiver_audio_unmuted");
+          sendMediaResult(event.senderId, request.requestId, "receiver_audio_unmuted");
         }
       }).catch((error) => {
         clearPlayTimeout();
-        sendOptionalMediaDiagnostic(event.senderId, request.requestId, safePlayRejection(error));
+        sendMediaResult(event.senderId, request.requestId, safePlayRejection(error));
       });
     };
     const ensurePlayablePosition = () => {
@@ -610,18 +713,20 @@
         return;
       }
       initialSeekRequested = true;
+      seekCount += 1; lastSeekKind = 1;
       playbackTelemetry("initial_seek_requested");
       const target = start + Math.min(0.05, Math.max(0, (end - start) / 2));
-      sendOptionalMediaDiagnostic(event.senderId, request.requestId, "initial_seek_requested");
-      try { video.currentTime = target; } catch (_) { sendOptionalMediaDiagnostic(event.senderId, request.requestId, "initial_seek_failed"); }
+      sendMediaResult(event.senderId, request.requestId, "initial_seek_requested");
+      try { video.currentTime = target; } catch (_) { sendMediaResult(event.senderId, request.requestId, "initial_seek_failed"); }
     };
     const recoverPlaybackPosition = () => {
       if (!initialSeekCompleted || recoverySeekPending || !firstRendered || !buffer || buffer.updating || !video.buffered || !video.buffered.length) return;
       const target = recoverySeekTarget(video.currentTime, video.buffered.start(0), video.buffered.end(0));
       if (target === null) return;
       recoverySeekPending = true;
-      sendOptionalMediaDiagnostic(event.senderId, request.requestId, "receiver_live_edge_recovery_seek");
-      try { video.currentTime = target; } catch (_) { recoverySeekPending = false; sendOptionalMediaDiagnostic(event.senderId, request.requestId, "recovery_seek_failed"); }
+      seekCount += 1; lastSeekKind = 2;
+      sendMediaResult(event.senderId, request.requestId, "receiver_live_edge_recovery_seek");
+      try { video.currentTime = target; } catch (_) { recoverySeekPending = false; sendMediaResult(event.senderId, request.requestId, "recovery_seek_failed"); }
     };
     const detectPlaybackStall = () => {
       if (!initialSeekCompleted || recoverySeekPending || !firstRendered || video.paused || video.ended || !video.buffered || !video.buffered.length) return;
@@ -631,48 +736,85 @@
       const target = stalledLiveEdgeSeekTarget(video.currentTime, start, end);
       if (target === null || target - video.currentTime < 0.02) return;
       playbackTelemetry("receiver_playback_stall_detected");
-      sendOptionalMediaDiagnostic(event.senderId, request.requestId, "receiver_playback_stall_detected");
+      sendMediaResult(event.senderId, request.requestId, "receiver_playback_stall_detected");
       recoverySeekPending = true;
+      seekCount += 1; lastSeekKind = 3;
       lastPlayback.recoveryAwaitingProgress = true;
-      sendOptionalMediaDiagnostic(event.senderId, request.requestId, "receiver_live_edge_recovery_seek");
+      sendMediaResult(event.senderId, request.requestId, "receiver_live_edge_recovery_seek");
       try {
         video.currentTime = target;
         clearRecoveryTimeout();
         lastPlayback.recoveryTimeout = global.setTimeout(() => {
           if (!lastPlayback.recoveryAwaitingProgress) return;
           lastPlayback.recoveryAwaitingProgress = false;
-          sendOptionalMediaDiagnostic(event.senderId, request.requestId, "receiver_playback_recovery_failed");
+          sendMediaResult(event.senderId, request.requestId, "receiver_playback_recovery_failed");
           playbackTelemetry("receiver_playback_recovery_failed");
         }, recoveryTimeoutMs);
       } catch (_) {
         recoverySeekPending = false; lastPlayback.recoveryAwaitingProgress = false;
-        sendOptionalMediaDiagnostic(event.senderId, request.requestId, "receiver_playback_recovery_failed");
+        sendMediaResult(event.senderId, request.requestId, "receiver_playback_recovery_failed");
+      }
+    };
+    const catchUpHealthyPlayback = () => {
+      if (receiverStopped || mediaRun !== activeMediaRun || !firstRendered || !initialSeekCompleted
+          || recoverySeekPending || !mediaAuthenticated || !socket || socket.readyState !== 1
+          || !buffer || buffer.updating || (audioRequested && audioBuffer && audioBuffer.updating)) return;
+      const now = performance.now();
+      const target = healthyCatchup.consider({
+        runID: mediaRun, nowMs: now, currentTime: video.currentTime,
+        videoRanges: readBufferedRanges(video.buffered),
+        audioRanges: audioRequested && audioBuffer ? readBufferedRanges(audioBuffer.buffered) : [],
+        syncPoints, audioRequested, audioReady: !!audioBuffer && audioInitAppended && !video.muted,
+        readyState: video.readyState, paused: video.paused, ended: video.ended, seeking: video.seeking,
+        mediaError: !!video.error, sourceOpen: !!source && source.readyState === "open",
+        videoUpdating: !!buffer && buffer.updating, audioUpdating: !!audioBuffer && audioBuffer.updating,
+        pendingDepth: pending.length, progressAgeMs: now - lastPlayback.advancedAt,
+        appendAgeMs: lastAppendAtMs === null ? Infinity : now - lastAppendAtMs,
+        renderAgeMs: lastRenderAtMs === null ? null : now - lastRenderAtMs
+      });
+      if (target === null) return;
+      recoverySeekPending = true;
+      healthySeekPending = true;
+      seekCount += 1; lastSeekKind = 4;
+      playbackTelemetry("healthy_live_edge_catchup_requested");
+      sendMediaResult(event.senderId, request.requestId, "healthy_live_edge_catchup_seek");
+      try { video.currentTime = target; }
+      catch (_) {
+        recoverySeekPending = false;
+        healthySeekPending = false;
+        healthyCatchup.completeSeek(mediaRun);
+        sendMediaResult(event.senderId, request.requestId, "healthy_live_edge_catchup_seek_failed");
       }
     };
     const regulateLiveEdge = () => {
-      const nextRate = liveEdgePlaybackRate(bufferedLead(video), video.playbackRate);
+      // One element carries both tracks; never speed audible AAC for long.
+      const nextRate = audioRequested
+        ? (video.playbackRate === 1 ? null : 1)
+        : liveEdgePlaybackRate(bufferedLead(video), video.playbackRate);
       if (nextRate === null || nextRate === video.playbackRate) return;
       video.playbackRate = nextRate;
-      sendOptionalMediaDiagnostic(event.senderId, request.requestId, nextRate > 1 ? "live_edge_catchup_enabled" : "live_edge_catchup_disabled");
+      rateChanges += 1;
+      sendMediaResult(event.senderId, request.requestId, nextRate > 1 ? "live_edge_catchup_enabled" : "live_edge_catchup_disabled");
     };
     const appendNext = () => {
       if (!buffer || buffer.updating || !pending.length) return;
       const item = pending.shift(); lastAppendingType = item.type; lastAppendingFragment = item.fragment || null;
+      lastAppendingSyncTimes = item.syncTimes || [];
       if (item.type === 1) {
         initAppendPending = true;
-        sendOptionalMediaDiagnostic(event.senderId, request.requestId, `init_append_started_len_${item.payload.byteLength}`);
+        sendMediaResult(event.senderId, request.requestId, `init_append_started_len_${item.payload.byteLength}`);
         initAppendTimeout = global.setTimeout(() => {
-          if (initAppendPending) { sendOptionalMediaDiagnostic(event.senderId, request.requestId, "init_append_timeout"); stop("append_failed"); }
+          if (initAppendPending) { sendMediaResult(event.senderId, request.requestId, "init_append_timeout"); stop("append_failed"); }
         }, 5000);
       }
       if (item.type === 2) {
         mediaAppendPending = true;
         correlations.start(lastAppendingFragment, performance.now(), captureStageMetrics());
-        sendOptionalMediaDiagnostic(event.senderId, request.requestId, `media_append_started_len_${item.payload.byteLength}`);
+        sendMediaResult(event.senderId, request.requestId, `media_append_started_len_${item.payload.byteLength}`);
       }
       try { buffer.appendBuffer(item.payload); } catch (_) {
-        if (item.type === 1) sendOptionalMediaDiagnostic(event.senderId, request.requestId, "init_append_synchronous_exception");
-        if (item.type === 2) sendOptionalMediaDiagnostic(event.senderId, request.requestId, "media_append_synchronous_exception");
+        if (item.type === 1) sendMediaResult(event.senderId, request.requestId, "init_append_synchronous_exception");
+        if (item.type === 2) sendMediaResult(event.senderId, request.requestId, "media_append_synchronous_exception");
         stop("append_failed");
       }
     };
@@ -685,12 +827,13 @@
       try { sendMediaResult(event.senderId, request.requestId, result); }
       catch (_) { /* Audio diagnostics cannot block video cleanup. */ }
       audioPending.length = 0;
+      audioTrimPending = false;
       initialAudioCredits.close();
       const failedBuffer = audioBuffer;
       audioBuffer = null;
       if (failedBuffer && source && source.readyState === "open" && !failedBuffer.updating) {
         try { source.removeSourceBuffer(failedBuffer); }
-        catch (_) { sendOptionalMediaDiagnostic(event.senderId, request.requestId, "receiver_audio_buffer_remove_failed_video_continues"); }
+        catch (_) { sendMediaResult(event.senderId, request.requestId, "receiver_audio_buffer_remove_failed_video_continues"); }
       }
     };
     const appendNextAudio = () => {
@@ -702,22 +845,32 @@
       }
       try {
         audioBuffer.appendBuffer(item.payload);
-        sendOptionalMediaDiagnostic(event.senderId, request.requestId, item.type === 3 ? "audio_init_append_started" : "audio_fragment_append_started");
+        sendMediaResult(event.senderId, request.requestId, item.type === 3 ? "audio_init_append_started" : "audio_fragment_append_started");
       } catch (_) {
         degradeAudio("audio_append_failed_video_continues");
       }
     };
+    const trimAudioHistory = () => {
+      if (receiverStopped || !audioBuffer || !audioInitAppended || audioBuffer.updating || typeof audioBuffer.remove !== "function") return false;
+      const ranges = readBufferedRanges(audioBuffer.buffered);
+      const current = containingRange(ranges, video.currentTime);
+      const end = current ? bufferedTrimEnd(video.currentTime, ranges[0].start, current.end) : null;
+      if (end === null) return false;
+      audioTrimPending = true;
+      try { audioBuffer.remove(0, end); return true; }
+      catch (_) { audioTrimPending = false; return false; }
+    };
     const enqueueAudio = (item) => {
-      if (!audioBuffer) { sendOptionalMediaDiagnostic(event.senderId, request.requestId, "audio_fragment_ignored_not_ready"); return; }
+      if (!audioBuffer) { sendMediaResult(event.senderId, request.requestId, "audio_fragment_ignored_not_ready"); return; }
       if (audioPending.length >= maxAudioPending) {
         audioPending.shift();
-        sendOptionalMediaDiagnostic(event.senderId, request.requestId, "audio_queue_evicted");
+        sendMediaResult(event.senderId, request.requestId, "audio_queue_evicted");
       }
       audioPending.push(item);
       appendNextAudio();
     };
     const enqueue = (item) => {
-      if (pending.length >= maxPending) { pending.splice(0, pending.length - maxPending + 1); }
+      if (pending.length >= maxPending) { pending.splice(0, pending.length - maxPending + 1); receiverDrops += 1; }
       pending.push(item); appendBacklogHighWatermark = Math.max(appendBacklogHighWatermark, pending.length); appendNext();
     };
     try {
@@ -725,21 +878,24 @@
       source.addEventListener("sourceopen", () => {
         try {
           buffer = source.addSourceBuffer(MIME_TYPE);
-          sendOptionalMediaDiagnostic(event.senderId, request.requestId, "source_buffer_created");
+          sendMediaResult(event.senderId, request.requestId, "source_buffer_created");
           if (audioRequested && global.MediaSource.isTypeSupported(AUDIO_MIME_TYPE) === true) {
             try {
               audioBuffer = source.addSourceBuffer(AUDIO_MIME_TYPE);
-              sendOptionalMediaDiagnostic(event.senderId, request.requestId, "receiver_audio_source_buffer_created");
-              sendOptionalMediaDiagnostic(event.senderId, request.requestId, "receiver_audio_ready");
+              sendMediaResult(event.senderId, request.requestId, "receiver_audio_source_buffer_created");
+              sendMediaResult(event.senderId, request.requestId, "receiver_audio_ready");
               initialAudioCredits.ready();
               audioBuffer.addEventListener("updateend", () => {
+                if (receiverStopped || mediaRun !== activeMediaRun) return;
+                if (audioTrimPending) { audioTrimPending = false; appendNextAudio(); return; }
                 if (lastAudioType === 3) {
                   audioInitAppended = true;
-                  sendOptionalMediaDiagnostic(event.senderId, request.requestId, "audio_init_append_updateend");
+                  sendMediaResult(event.senderId, request.requestId, "audio_init_append_updateend");
                 } else if (lastAudioType === 4 && initialAudioCredits.sent) {
-                  sendOptionalMediaDiagnostic(event.senderId, request.requestId, "audio_fragment_append_updateend");
+                  sendMediaResult(event.senderId, request.requestId, "audio_fragment_append_updateend");
                   emitAudioCredit();
                 }
+                if (trimAudioHistory()) return;
                 appendNextAudio();
               });
               audioBuffer.addEventListener("error", () => {
@@ -747,14 +903,15 @@
               });
             } catch (_) {
               audioBuffer = null;
-              sendOptionalMediaDiagnostic(event.senderId, request.requestId, "receiver_audio_unsupported_video_continues");
+              sendMediaResult(event.senderId, request.requestId, "receiver_audio_unsupported_video_continues");
             }
           }
           buffer.addEventListener("updateend", () => {
+            if (receiverStopped || mediaRun !== activeMediaRun) return;
             if (lastAppendingType === 1 && initAppendPending) {
               initAppendPending = false;
               clearInitAppendTimeout();
-              sendOptionalMediaDiagnostic(event.senderId, request.requestId, "init_append_updateend");
+              sendMediaResult(event.senderId, request.requestId, "init_append_updateend");
               if (!mediaReadySent) {
                 mediaReadySent = true;
                 sendReceiverDiagnostic(event, request, "receiver_media_ready_received");
@@ -765,9 +922,14 @@
             if (lastAppendingType === 2 && mediaAppendPending) {
               mediaAppendPending = false;
               appendedFragments += 1;
+              lastAppendAtMs = performance.now();
+              for (const syncTime of lastAppendingSyncTimes) {
+                syncPoints.push(syncTime);
+                if (syncPoints.length > 16) syncPoints.shift();
+              }
               correlations.append(lastAppendingFragment, performance.now(), captureStageMetrics());
               pacing.append(performance.now());
-              sendOptionalMediaDiagnostic(event.senderId, request.requestId, "media_append_updateend");
+              sendMediaResult(event.senderId, request.requestId, "media_append_updateend");
               if (mediaReadySent) emitMediaCredit();
               playbackTelemetry("first_media_append");
             }
@@ -775,23 +937,27 @@
             attemptPlay();
             recoverPlaybackPosition();
             detectPlaybackStall();
+            catchUpHealthyPlayback();
             regulateLiveEdge();
             // Preserve a full GOP behind the playhead. Trimming at 0.1 seconds
             // can evict the current decode dependency and force a recovery seek.
-            const trimEnd = video.buffered.length ? bufferedTrimEnd(video.currentTime, video.buffered.start(0), video.buffered.end(0)) : null;
+            const videoRanges = readBufferedRanges(video.buffered);
+            const currentVideoRange = containingRange(videoRanges, video.currentTime);
+            const trimEnd = currentVideoRange
+              ? bufferedTrimEnd(video.currentTime, videoRanges[0].start, currentVideoRange.end) : null;
             if (trimEnd !== null && typeof buffer.remove === "function" && !buffer.updating) {
               try { buffer.remove(0, trimEnd); } catch (_) {}
             }
             appendNext();
           });
           buffer.addEventListener("error", () => {
-            if (lastAppendingType === 1 && initAppendPending) sendOptionalMediaDiagnostic(event.senderId, request.requestId, "init_append_error_event");
-            if (lastAppendingType === 2 && mediaAppendPending) sendOptionalMediaDiagnostic(event.senderId, request.requestId, "media_append_error_event");
+            if (lastAppendingType === 1 && initAppendPending) sendMediaResult(event.senderId, request.requestId, "init_append_error_event");
+            if (lastAppendingType === 2 && mediaAppendPending) sendMediaResult(event.senderId, request.requestId, "media_append_error_event");
             stop("append_failed");
           });
           buffer.addEventListener("abort", () => {
-            if (lastAppendingType === 1 && initAppendPending) sendOptionalMediaDiagnostic(event.senderId, request.requestId, "init_append_abort_event");
-            if (lastAppendingType === 2 && mediaAppendPending) sendOptionalMediaDiagnostic(event.senderId, request.requestId, "media_append_abort_event");
+            if (lastAppendingType === 1 && initAppendPending) sendMediaResult(event.senderId, request.requestId, "init_append_abort_event");
+            if (lastAppendingType === 2 && mediaAppendPending) sendMediaResult(event.senderId, request.requestId, "media_append_abort_event");
             stop("append_aborted");
           });
           sendReceiverDiagnostic(event, request, "receiver_endpoint_connect_attempted");
@@ -825,14 +991,14 @@
               const control = parse(message.data); if (!control) { stop("protocol_error"); return; }
               if (control.type === "readyForMedia" && control.protocolVersion === PROTOCOL_VERSION && Object.keys(control).length === 2) {
                 mediaAuthenticated = true;
+                startPlaybackSamples();
                 initialAudioCredits.authenticated();
                 sendReceiverDiagnostic(event, request, "receiver_auth_validation_passed");
                 sendReceiverDiagnostic(event, request, "receiver_endpoint_fetch_succeeded");
                 return;
               }
               if (control.type === "normalStop" && control.protocolVersion === PROTOCOL_VERSION && Object.keys(control).length === 2) {
-                logStopAcknowledgement("normal_stop_received", { controlType: control.type, controlProtocolVersion: control.protocolVersion });
-                dispatchStopAcknowledgement("receiver_stop_received");
+                sendMediaResult(event.senderId, request.requestId, "receiver_stop_received");
                 clearVideoForReceiverStop("stopped");
                 try { socket.close(1000, "normal_stop"); } catch (_) {}
                 return;
@@ -856,15 +1022,17 @@
               let fragment = null;
               if (summary) {
                 fragment = correlations.receive(envelope.sequence, summary.decodeTime / 90000, performance.now(), captureStageMetrics());
-                sendOptionalMediaDiagnostic(event.senderId, request.requestId, `media_fragment_received_len_${envelope.payload.byteLength}`);
-                sendOptionalMediaDiagnostic(event.senderId, request.requestId, `first_fragment_seq_${summary.sequence}_samples_${summary.sampleCount}_tfdt_${summary.decodeTime}_offset_${summary.dataOffset}_payload_${summary.payloadLength}_nal_${summary.firstNALType}`);
+                sendMediaResult(event.senderId, request.requestId, `media_fragment_received_len_${envelope.payload.byteLength}`);
+                sendMediaResult(event.senderId, request.requestId, `first_fragment_seq_${summary.sequence}_samples_${summary.sampleCount}_tfdt_${summary.decodeTime}_offset_${summary.dataOffset}_payload_${summary.payloadLength}_nal_${summary.firstNALType}`);
               } else {
-                sendOptionalMediaDiagnostic(event.senderId, request.requestId, "media_fragment_layout_invalid");
+                sendMediaResult(event.senderId, request.requestId, "media_fragment_layout_invalid");
               }
-              firstKeyframe = true; enqueue({ ...envelope, fragment }); return;
+              firstKeyframe = true;
+              enqueue({ ...envelope, fragment, syncTimes: summary ? summary.syncTimes : [] });
+              return;
             }
             if (envelope.type === 3 || envelope.type === 4) {
-              if (!audioRequested) { sendOptionalMediaDiagnostic(event.senderId, request.requestId, "audio_envelope_rejected_not_negotiated"); return; }
+              if (!audioRequested) { sendMediaResult(event.senderId, request.requestId, "audio_envelope_rejected_not_negotiated"); return; }
               enqueueAudio(envelope); return;
             }
             stop("binary_envelope_invalid");
@@ -881,69 +1049,76 @@
           }; socket.onclose = (closeEvent) => {
             global.clearTimeout(socketConnectTimeout);
             mediaAuthenticated = false;
+            clearPlaybackSampleTimer();
             initialAudioCredits.close();
             if (!receiverStopped) {
-              const code = closeEvent && Number.isInteger(closeEvent.code) ? closeEvent.code : 0;
-              logStopAcknowledgement("socket_closed_without_prior_stop", { closeCode: code, wasClean: !!(closeEvent && closeEvent.wasClean) });
-              dispatchStopAcknowledgement("receiver_stop_received");
+              sendMediaResult(event.senderId, request.requestId, "receiver_stop_received");
               clearVideoForReceiverStop(closeScreen(closeEvent, socketFailed));
             }
             if (!firstRendered) {
               const code = closeEvent && Number.isInteger(closeEvent.code) ? closeEvent.code : 0;
               sendReceiverDiagnostic(event, request, "receiver_endpoint_fetch_failed");
               sendReceiverDiagnostic(event, request, `receiver_error_before_disconnect_websocket_closed_${code}`);
-              sendOptionalMediaDiagnostic(event.senderId, request.requestId, "websocket_closed");
+              sendMediaResult(event.senderId, request.requestId, "websocket_closed");
             }
           };
-          sendOptionalMediaDiagnostic(event.senderId, request.requestId, "media_socket_connecting");
+          sendMediaResult(event.senderId, request.requestId, "media_socket_connecting");
         } catch (_) { stop("sourcebuffer_failed"); }
       }, { once: true });
-      source.addEventListener("sourceended", () => sendOptionalMediaDiagnostic(event.senderId, request.requestId, "media_source_state_ended"));
-      source.addEventListener("sourceclose", () => sendOptionalMediaDiagnostic(event.senderId, request.requestId, "media_source_state_closed"));
-      video.addEventListener("error", () => sendOptionalMediaDiagnostic(event.senderId, request.requestId, `media_element_error_code_${video.error ? video.error.code : 0}`));
-      video.addEventListener("loadedmetadata", () => sendOptionalMediaDiagnostic(event.senderId, request.requestId, "media_event_loadedmetadata"));
-      video.addEventListener("loadeddata", () => sendOptionalMediaDiagnostic(event.senderId, request.requestId, "media_event_loadeddata"));
-      video.addEventListener("canplay", () => sendOptionalMediaDiagnostic(event.senderId, request.requestId, "media_event_canplay"));
-      video.addEventListener("canplaythrough", () => sendOptionalMediaDiagnostic(event.senderId, request.requestId, "media_event_canplaythrough"));
+      source.addEventListener("sourceended", () => sendMediaResult(event.senderId, request.requestId, "media_source_state_ended"));
+      source.addEventListener("sourceclose", () => sendMediaResult(event.senderId, request.requestId, "media_source_state_closed"));
+      video.addEventListener("error", () => sendMediaResult(event.senderId, request.requestId, `media_element_error_code_${video.error ? video.error.code : 0}`));
+      video.addEventListener("loadedmetadata", () => sendMediaResult(event.senderId, request.requestId, "media_event_loadedmetadata"));
+      video.addEventListener("loadeddata", () => sendMediaResult(event.senderId, request.requestId, "media_event_loadeddata"));
+      video.addEventListener("canplay", () => sendMediaResult(event.senderId, request.requestId, "media_event_canplay"));
+      video.addEventListener("canplaythrough", () => sendMediaResult(event.senderId, request.requestId, "media_event_canplaythrough"));
       video.addEventListener("waiting", () => {
         scheduleReconnectingScreen();
-        sendOptionalMediaDiagnostic(event.senderId, request.requestId, "media_event_waiting");
+        sendMediaResult(event.senderId, request.requestId, "media_event_waiting");
       });
       video.addEventListener("stalled", () => {
         scheduleReconnectingScreen();
-        sendOptionalMediaDiagnostic(event.senderId, request.requestId, "media_event_stalled");
+        sendMediaResult(event.senderId, request.requestId, "media_event_stalled");
       });
-      video.addEventListener("seeking", () => sendOptionalMediaDiagnostic(event.senderId, request.requestId, recoverySeekPending ? "recovery_seek_started" : "initial_seek_started"));
+      video.addEventListener("seeking", () => sendMediaResult(event.senderId, request.requestId, recoverySeekPending ? "recovery_seek_started" : "initial_seek_started"));
       video.addEventListener("seeked", () => {
+        if (receiverStopped || mediaRun !== activeMediaRun) return;
         if (recoverySeekPending) {
           recoverySeekPending = false;
-          sendOptionalMediaDiagnostic(event.senderId, request.requestId, "recovery_seek_completed");
-          try { Promise.resolve(video.play()).catch((error) => sendOptionalMediaDiagnostic(event.senderId, request.requestId, safePlayRejection(error))); } catch (_) { sendOptionalMediaDiagnostic(event.senderId, request.requestId, "recovery_play_synchronous_exception"); }
+          healthyCatchup.completeSeek(mediaRun);
+          const healthy = healthySeekPending;
+          healthySeekPending = false;
+          sendMediaResult(event.senderId, request.requestId,
+            healthy ? "healthy_live_edge_catchup_completed" : "recovery_seek_completed");
+          if (!healthy || video.paused) {
+            try { Promise.resolve(video.play()).catch((error) => sendMediaResult(event.senderId, request.requestId, safePlayRejection(error))); } catch (_) { sendMediaResult(event.senderId, request.requestId, "recovery_play_synchronous_exception"); }
+          }
           return;
         }
         if (!initialSeekRequested) return;
         initialSeekCompleted = true;
         playbackTelemetry("before_play");
-        sendOptionalMediaDiagnostic(event.senderId, request.requestId, "initial_seek_completed");
+        sendMediaResult(event.senderId, request.requestId, "initial_seek_completed");
         attemptPlay();
       });
       video.addEventListener("playing", () => {
         clearReconnectingScreenTimer();
         if (!receiverStopped && !ui.panel.hidden) showScreen("playing");
-        sendOptionalMediaDiagnostic(event.senderId, request.requestId, "media_event_playing");
+        sendMediaResult(event.senderId, request.requestId, "media_event_playing");
       });
       video.addEventListener("timeupdate", () => {
-        if (!timeUpdated) { timeUpdated = true; sendOptionalMediaDiagnostic(event.senderId, request.requestId, "media_event_timeupdate"); }
+        if (!timeUpdated) { timeUpdated = true; sendMediaResult(event.senderId, request.requestId, "media_event_timeupdate"); }
         if (video.currentTime > lastPlayback.time + 0.01) {
           lastPlayback.time = video.currentTime;
           lastPlayback.advancedAt = performance.now();
           if (lastPlayback.recoveryAwaitingProgress) {
             lastPlayback.recoveryAwaitingProgress = false;
             clearRecoveryTimeout();
-            sendOptionalMediaDiagnostic(event.senderId, request.requestId, "receiver_playback_recovered");
+            sendMediaResult(event.senderId, request.requestId, "receiver_playback_recovered");
             playbackTelemetry("receiver_playback_recovered");
           }
         }
+        catchUpHealthyPlayback();
         if (latencyFallback && latencyCorrelations.size) { const mediaTime = video.currentTime; const nearest = Array.from(latencyCorrelations.values()).sort((a, b) => Math.abs(a.mediaTime - mediaTime) - Math.abs(b.mediaTime - mediaTime))[0]; if (nearest && Math.abs(nearest.mediaTime - mediaTime) <= 0.05) { latencyCorrelations.delete(nearest.sequence); sendLatency({ type: "renderedFrame", generation: nearest.generation, sequence: nearest.sequence, receiverTimeMs: performance.now(), mediaTimeMs: Math.round(mediaTime * 1000), presentedFrames: 0, bufferLeadMs: Math.round(bufferedLead(video) * 1000), fallback: true }); } }
       });
     } catch (_) { stop("media_source_failed"); }
@@ -975,7 +1150,33 @@
     const dataOffset = view.getUint32(trun.offset + 16); const payloadStart = moof.offset + dataOffset;
     if (payloadStart < mdat.offset + 8 || payloadStart + 5 > mdat.offset + mdat.size) return null;
     const nalLength = view.getUint32(payloadStart); if (nalLength === 0 || payloadStart + 4 + nalLength > mdat.offset + mdat.size) return null;
-    return { sequence: view.getUint32(mfhd.offset + 12), sampleCount: view.getUint32(trun.offset + 12), decodeTime, dataOffset, payloadLength: mdat.size - 8, firstNALType: bytes[payloadStart + 4] & 0x1f };
+    // The sender marks every IDR sample in trun, including an IDR that is
+    // not the first sample of a fragment. Bound parsing and index only the
+    // successfully appended random-access points.
+    const sampleCount = view.getUint32(trun.offset + 12);
+    const trunVersion = bytes[trun.offset + 8];
+    const flags = view.getUint32(trun.offset + 8) & 0x00ffffff;
+    const hasSampleFields = (flags & 0x000701) === 0x000701;
+    const hasCTO = (flags & 0x000800) !== 0;
+    const stride = hasCTO ? 16 : 12;
+    const syncTimes = [];
+    if (hasSampleFields && sampleCount > 0 && sampleCount <= 32
+        && trun.offset + 20 + sampleCount * stride <= trun.offset + trun.size) {
+      let time = decodeTime; let totalSize = 0;
+      for (let i = 0; i < sampleCount; i += 1) {
+        const offset = trun.offset + 20 + i * stride;
+        const duration = view.getUint32(offset); const size = view.getUint32(offset + 4);
+        const sampleFlags = view.getUint32(offset + 8);
+        totalSize += size;
+        if (!duration || !size || totalSize > mdat.size - 8) { syncTimes.length = 0; break; }
+        const cto = hasCTO ? (trunVersion === 1 ? view.getInt32(offset + 12) : view.getUint32(offset + 12)) : 0;
+        if (sampleFlags === 0x02000000 && Number.isSafeInteger(time + cto) && time + cto >= 0) {
+          syncTimes.push((time + cto) / 90000);
+        }
+        time += duration;
+      }
+    }
+    return { sequence: view.getUint32(mfhd.offset + 12), sampleCount, decodeTime, dataOffset, payloadLength: mdat.size - 8, firstNALType: bytes[payloadStart + 4] & 0x1f, syncStart: syncTimes.includes(decodeTime / 90000), syncTimes };
   }
   function bufferedLead(video) {
     for (let i = 0; i < video.buffered.length; i += 1) if (video.currentTime >= video.buffered.start(i) && video.currentTime <= video.buffered.end(i)) return video.buffered.end(i) - video.currentTime;
@@ -1306,6 +1507,6 @@
     lifecycleDiagnostics.record("receiver_caf_start_returned");
 
   }
-  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ effectiveReceiverConfigHash, SCREEN_COPY, closeScreen, MIME_TYPE, AUDIO_MIME_TYPE, RESULT, validEndpoint, validateProbe, validateMediaStart, validateReadyQuery, makeReadyReport, receiverReadinessStateForScreen, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, makeLatencyStage, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createInitialAudioCreditDelivery, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
+  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ effectiveReceiverConfigHash, SCREEN_COPY, closeScreen, MIME_TYPE, AUDIO_MIME_TYPE, RESULT, validEndpoint, validateProbe, validateMediaStart, validateReadyQuery, makeReadyReport, receiverReadinessStateForScreen, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, readBufferedRanges, createHealthyLiveEdgeCatchup, summarizeFragment, makeLatencyStage, makePeriodicPlaybackSample, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createInitialAudioCreditDelivery, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
   if (typeof document !== "undefined") document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", boot, { once: true }) : boot();
 })(globalThis);
