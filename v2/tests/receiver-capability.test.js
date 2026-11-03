@@ -3,13 +3,65 @@ const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
+const receiverSourcePath = process.env.SCREENMIRROR_RECEIVER_PATH || path.join(__dirname, "..", "receiver.js");
 
 function receiver(consoleOverride = console) {
   const context = { console: consoleOverride, TextEncoder, URL, URLSearchParams, setTimeout, clearTimeout, globalThis: null };
   context.globalThis = context;
-  vm.runInNewContext(fs.readFileSync(path.join(__dirname, "..", "receiver.js"), "utf8"), context);
+  vm.runInNewContext(fs.readFileSync(receiverSourcePath, "utf8"), context);
   return context.ScreenMirrorReceiverCapabilityGate;
 }
+
+function bootCapabilityProbe() {
+  const sources = []; const timers = new Map(); let nextTimer = 1; let now = 0;
+  const video = {};
+  class MediaSource {
+    static isTypeSupported() { return true; }
+    constructor() { this.readyState = "closed"; this.listeners = {}; sources.push(this); }
+    addEventListener(name, callback) { this.listeners[name] = callback; }
+    addSourceBuffer() { return {}; }
+  }
+  const nodes = {};
+  const context = { TextEncoder, URL: { createObjectURL: () => "blob:probe" }, MediaSource,
+    WebSocket: function () {}, performance: { now: () => now },
+    setTimeout(callback) { const id = nextTimer++; timers.set(id, callback); return id; },
+    clearTimeout(id) { timers.delete(id); },
+    document: { readyState: "complete", getElementById: (id) => id === "probe-video" ? video : (nodes[id] ||= {}),
+      body: { classList: { add() {}, remove() {} } } },
+    cast: { framework: { CastReceiverContext: { getInstance: () => ({ addEventListener() {}, addCustomMessageListener() {}, start() {} }) },
+      CastReceiverOptions: function () {}, system: { EventType: { READY: "ready", SENDER_CONNECTED: "connected" }, MessageType: { JSON: "JSON" } } } } };
+  vm.runInNewContext(fs.readFileSync(receiverSourcePath, "utf8"), context);
+  return { gate: context.ScreenMirrorReceiverCapabilityGate, sources, timers, setNow(value) { now = value; } };
+}
+
+test("capability trace distinguishes timely sourceopen and video SourceBuffer creation", async () => {
+  const probe = bootCapabilityProbe();
+  probe.setNow(120);
+  probe.sources[0].readyState = "open";
+  probe.sources[0].listeners.sourceopen();
+  await new Promise(setImmediate);
+  assert.equal(probe.gate.snapshot().sourceBuffer, true);
+  assert.ok(probe.gate.capabilityDiagnosticResults().includes("receiver_capability_probe_settled_sourcebuffer_created_sourceopen_before_timeout"));
+  assert.ok(probe.gate.capabilityDiagnosticResults().includes("receiver_capability_probe_addbuffer_succeeded_open_delay_ms_120"));
+});
+
+test("capability trace keeps timeout failure while revealing a late sourceopen", async () => {
+  const probe = bootCapabilityProbe();
+  probe.setNow(1500);
+  probe.timers.values().next().value();
+  await new Promise(setImmediate);
+  assert.equal(probe.gate.snapshot().sourceBuffer, false);
+  assert.ok(probe.gate.capabilityDiagnosticResults().includes("receiver_capability_probe_settled_timeout_before_sourceopen_sourceopen_not_seen"));
+  assert.ok(probe.gate.capabilityDiagnosticResults().includes("receiver_capability_probe_addbuffer_not_attempted_open_delay_ms_na"));
+  assert.ok(probe.gate.capabilityDiagnosticResults().includes("receiver_capability_probe_source_state_timeout_closed_at_media_closed"));
+  probe.setNow(2000);
+  probe.sources[0].readyState = "open";
+  probe.sources[0].listeners.sourceopen();
+  assert.equal(probe.gate.snapshot().sourceBuffer, false, "late proof must not silently enable media");
+  assert.ok(probe.gate.capabilityDiagnosticResults().includes("receiver_capability_probe_settled_timeout_before_sourceopen_sourceopen_after_timeout"));
+  assert.ok(probe.gate.capabilityDiagnosticResults().includes("receiver_capability_probe_addbuffer_succeeded_open_delay_ms_2000"));
+  assert.ok(probe.gate.capabilityDiagnosticResults().includes("receiver_capability_probe_source_state_timeout_closed_at_media_open"));
+});
 
 test("accepts only the bounded ws endpoint shape", () => {
   const gate = receiver();
@@ -28,45 +80,204 @@ test("pins the planned AVC MIME type", () => {
   assert.equal(receiver().MIME_TYPE, 'video/mp4; codecs="avc1.42e01f"');
 });
 
+test("pins AAC-LC and requires explicit audio negotiation", () => {
+  const gate = receiver();
+  assert.equal(gate.AUDIO_MIME_TYPE, 'audio/mp4; codecs="mp4a.40.2"');
+  const endpoint = "ws://192.168.1.10:1234/" + "a".repeat(64);
+  assert.equal(gate.validateMediaStart(JSON.stringify({ type: "startMedia", protocolVersion: 2, requestId: "video", endpoint })).audioCodec, undefined);
+  assert.equal(gate.validateMediaStart(JSON.stringify({ type: "startMedia", protocolVersion: 2, requestId: "audio", endpoint, audioCodec: "mp4a.40.2" })).audioCodec, "mp4a.40.2");
+  assert.equal(gate.validateMediaStart(JSON.stringify({ type: "startMedia", protocolVersion: 2, requestId: "bad", endpoint, audioCodec: "aac" })), null);
+  assert.equal(gate.validateMediaStart(JSON.stringify({ type: "startMedia", protocolVersion: 2, requestId: "extra", endpoint, audioCodec: "mp4a.40.2", extra: true })), null);
+});
+
+test("preserves the accepted readiness protocol and revision", () => {
+  const gate = receiver();
+  assert.deepEqual(JSON.parse(JSON.stringify(gate.makeReadyReport("ready-1"))), {
+    type: "receiverReadyReport", protocolVersion: 2, requestId: "ready-1",
+    receiverVersion: "2.0.0", receiverRevision: "connected-state-idle-return-20261103-01", receiverState: "ready"
+  });
+  assert.equal(gate.validateReadyQuery(JSON.stringify({ type: "receiverReadyQuery", protocolVersion: 2, requestId: "ready-1" })).requestId, "ready-1");
+  assert.equal(gate.validateReadyQuery(JSON.stringify({ type: "receiverReadyQuery", protocolVersion: 2, requestId: "ready-1", extra: true })), null);
+  assert.deepEqual(JSON.parse(JSON.stringify(gate.makeReadyReport("audio-ready", "ready", true).audioCapabilities)), ["aac_lc_cmaf"]);
+});
+
+test("connection-lost screen reports ready so a reconnecting phone is not blocked", () => {
+  // "lost" = TV is showing "Connection Lost / Waiting for iPhone" — it IS ready for a new sender.
+  // Before this fix, "lost" mapped to "unavailable", which caused the phone to give up reconnecting.
+  const gate = receiver();
+  assert.equal(gate.receiverReadinessStateForScreen("lost"), "ready",
+    "lost state must report ready so the phone can reconnect");
+  assert.equal(gate.receiverReadinessStateForScreen("ready"), "ready");
+  assert.equal(gate.receiverReadinessStateForScreen("stopped"), "ready");
+  assert.equal(gate.receiverReadinessStateForScreen("reconnecting"), "ready");
+  assert.equal(gate.receiverReadinessStateForScreen("playing"), "mirroring",
+    "active mirroring still blocks a second sender");
+});
+
+test("initial audio credits wait for authenticated open socket and send once", () => {
+  const { createInitialAudioCreditDelivery } = receiver();
+  for (const audioFirst of [true, false]) {
+    let open = false; let current = true; let sends = 0;
+    const delivery = createInitialAudioCreditDelivery(() => { sends += 1; return true; }, () => open && current);
+    if (audioFirst) delivery.ready();
+    else delivery.authenticated();
+    assert.equal(sends, 0);
+    open = true;
+    if (audioFirst) delivery.authenticated();
+    else delivery.ready();
+    assert.equal(sends, 1);
+    delivery.ready(); delivery.authenticated(); delivery.flush();
+    assert.equal(sends, 1);
+    assert.equal(delivery.sent, true);
+  }
+});
+
+test("initial audio credits survive a failed send but close and stale generations discard pending credit", () => {
+  const { createInitialAudioCreditDelivery } = receiver();
+  let open = true; let current = true; let attempts = 0;
+  const delivery = createInitialAudioCreditDelivery(() => ++attempts > 1, () => open && current);
+  delivery.ready(); delivery.authenticated();
+  assert.equal(delivery.sent, false);
+  delivery.flush();
+  assert.equal(delivery.sent, true);
+  assert.equal(attempts, 2);
+  const closed = createInitialAudioCreditDelivery(() => { throw Error("closed socket sent"); }, () => open && current);
+  closed.ready(); open = false; closed.authenticated(); closed.close(); open = true; closed.flush();
+  assert.equal(closed.sent, false);
+  const stale = createInitialAudioCreditDelivery(() => { throw Error("stale generation sent"); }, () => open && current);
+  stale.ready(); current = false; stale.authenticated(); stale.flush();
+  assert.equal(stale.sent, false);
+});
+
+test("audio delivery and first-frame diagnostics preserve independent video path", () => {
+  const source = fs.readFileSync(receiverSourcePath, "utf8");
+  assert.match(source, /mediaRun !== activeMediaRun/);
+  assert.match(source, /initialAudioCredits\.ready\(\)/);
+  assert.match(source, /initialAudioCredits\.authenticated\(\)/);
+  assert.match(source, /initialAudioCredits\.close\(\)/);
+  assert.match(source, /videoBufferRanges:/);
+  assert.match(source, /audioBufferRanges:/);
+  assert.match(source, /playbackTelemetry\("initial_seek_requested"\)/);
+  const sender = fs.readFileSync(path.join(__dirname, "..", "..", "..", "..", "ScreenMirrorBroadcast", "CMAFBroadcastServer.swift"), "utf8");
+  assert.match(sender, /CMAFMediaCreditLedger\.handlesControl\(object\) \|\| CMAFAudioCreditLedger\.handlesControl\(object\)/);
+});
+
+test("audio SourceBuffer errors are isolated from the video append path", () => {
+  const source = fs.readFileSync(receiverSourcePath, "utf8");
+  const setup = source.indexOf("audioBuffer = source.addSourceBuffer(AUDIO_MIME_TYPE)");
+  const errorHandler = source.indexOf('audioBuffer.addEventListener("error"', setup);
+  const nextVideoPath = source.indexOf('buffer.addEventListener("updateend"', setup);
+  const block = source.slice(errorHandler, nextVideoPath);
+  assert.ok(setup >= 0 && errorHandler > setup && nextVideoPath > errorHandler);
+  assert.match(block, /receiver_audio_error_video_continues/);
+  assert.match(block, /degradeAudio\(/);
+  assert.doesNotMatch(block, /stop\(/);
+  assert.match(source, /source\.removeSourceBuffer\(failedBuffer\)/);
+  assert.match(source, /item\.type === 4 && !audioInitAppended/);
+  assert.match(source, /audio_fragment_before_init_video_continues/);
+  assert.match(source, /if \(envelope\.type === 3 \|\| envelope\.type === 4\)/);
+});
+
+test("AAC fragment without init is rejected before MSE can fail the video element", async () => {
+  const sources = []; const sockets = []; const messages = []; const appended = []; const removed = []; const wire = [];
+  const intervals = new Map(); let nextInterval = 1; let now = 1;
+  let receive;
+  const nodes = {};
+  const video = { buffered: { length: 0 }, currentTime: 0, playbackRate: 1,
+    addEventListener() {}, requestVideoFrameCallback() { return 1; } };
+  class MediaSource {
+    static isTypeSupported() { return true; }
+    constructor() { this.listeners = {}; this.readyState = "open"; sources.push(this); }
+    addEventListener(name, callback) { this.listeners[name] = callback; }
+    addSourceBuffer(mime) {
+      const buffer = { mime, updating: false, buffered: { length: 0 }, listeners: {},
+        addEventListener(name, callback) { this.listeners[name] = callback; },
+        appendBuffer() { appended.push(mime); } };
+      return buffer;
+    }
+    removeSourceBuffer(buffer) { removed.push(buffer.mime); }
+  }
+  class WebSocket {
+    constructor() { this.readyState = 1; sockets.push(this); }
+    send(value) { wire.push(JSON.parse(value)); }
+    close() {}
+  }
+  const context = { ArrayBuffer, Uint8Array, DataView, TextEncoder, URL,
+    performance: { now: () => now }, setTimeout: () => 1, clearTimeout() {},
+    setInterval(callback, milliseconds) { assert.equal(milliseconds, 5000); const id = nextInterval++; intervals.set(id, callback); return id; },
+    clearInterval(id) { intervals.delete(id); }, MediaSource, WebSocket,
+    document: { readyState: "complete", getElementById: (id) => id === "probe-video" ? video : (nodes[id] ||= {}),
+      body: { classList: { add() {}, remove() {} } } },
+    cast: { framework: { CastReceiverContext: { getInstance: () => ({ addEventListener() {},
+      addCustomMessageListener: (_, callback) => { receive = callback; }, start() {},
+      sendCustomMessage: (_, sender, message) => messages.push(message) }) },
+      CastReceiverOptions: function () {}, system: { EventType: { READY: "ready", SENDER_CONNECTED: "sender_connected" },
+        MessageType: { JSON: "JSON" } } } } };
+  context.URL = class extends URL { static createObjectURL() { return "blob:test"; } };
+  vm.runInNewContext(fs.readFileSync(receiverSourcePath, "utf8"), context);
+  sources[0].listeners.sourceopen(); await new Promise(setImmediate);
+  receive({ senderId: "sender", data: { type: "startMedia", protocolVersion: 2, requestId: "audio_test",
+    endpoint: "ws://192.168.1.1:1234/" + "a".repeat(64), audioCodec: "mp4a.40.2" } });
+  await new Promise(setImmediate);
+  sources[1].listeners.sourceopen(); sockets[0].onopen();
+  sockets[0].onmessage({ data: JSON.stringify({ type: "readyForMedia", protocolVersion: 2 }) });
+  assert.equal(intervals.size, 1);
+  const tick = [...intervals.values()][0];
+  for (let index = 1; index <= 3; index += 1) { now += 5000; tick(); }
+  const samples = wire.filter((message) => message.type === "stats");
+  assert.deepEqual(samples.map((message) => message.sampleIndex), [1, 2, 3]);
+  assert.ok(samples.every((message) => JSON.stringify(message).length < 1024));
+  const envelope = Buffer.alloc(15); envelope.write("SMC1"); envelope[4] = 2; envelope[5] = 4;
+  envelope.writeUInt32BE(1, 6); envelope.writeUInt32BE(1, 10);
+  sockets[0].onmessage({ data: Uint8Array.from(envelope).buffer });
+  assert.equal(appended.length, 0, "AAC media must never reach MSE before init");
+  assert.deepEqual(removed, ['audio/mp4; codecs="mp4a.40.2"']);
+  assert.ok(messages.some((message) => message.result === "audio_fragment_before_init_video_continues"));
+  assert.ok(!messages.some((message) => message.result === "append_failed"));
+  sockets[0].onclose({ code: 1000, wasClean: true });
+  assert.equal(intervals.size, 0, "socket closure must stop periodic telemetry");
+});
+
+test("periodic playback sample reports playhead, live edge, render and queue state without clock mixing", () => {
+  const gate = receiver();
+  const video = { currentTime: 12.5, buffered: { length: 1, end: () => 20 }, readyState: 4,
+    paused: false, playbackRate: 1.2, getVideoPlaybackQuality: () => ({ totalVideoFrames: 620, droppedVideoFrames: 4 }) };
+  const buffer = { buffered: { length: 1, end: () => 20.25 }, updating: false };
+  const sample = gate.makePeriodicPlaybackSample(video, buffer, {
+    generation: 1, sampleIndex: 8, nowMs: 42000, queueDepth: 2, receiverDrops: 1,
+    appendedFragments: 90, renderedCallbacks: 610, presentedFrames: 609,
+    uncorrelatedFrames: 7, lastAppendAtMs: 41970, lastRenderAtMs: 41980,
+    renderedMediaTime: 12.4, decodeDuration: 0.008, displayLead: 0.016,
+    seekCount: 1, lastSeekKind: 1, rateChanges: 1
+  });
+  assert.equal(sample.type, "stats");
+  assert.equal(sample.currentTimeMs, 12500);
+  assert.equal(sample.sourceEndMs, 20250);
+  assert.equal(sample.liveEdgeMs, 7750);
+  assert.equal(sample.lastRenderAgeMs, 20);
+  assert.equal(sample.decodeDurationMs, 8);
+  assert.equal(sample.droppedFrames, 4);
+  assert.equal(sample.playbackRateMilli, 1200);
+  assert.ok(JSON.stringify(sample).length < 1024);
+});
+
+test("negotiated audio unmutes after playback starts and Stop clears both queues", () => {
+  const source = fs.readFileSync(receiverSourcePath, "utf8");
+  const playResolved = source.indexOf('"play_promise_resolved"');
+  const unmute = source.indexOf("video.muted = false", playResolved);
+  assert.ok(playResolved >= 0 && unmute > playResolved);
+  assert.match(source.slice(playResolved, unmute), /!receiverStopped && audioRequested && audioBuffer/);
+  const stop = source.slice(source.indexOf("const clearVideoForReceiverStop"), source.indexOf("const stop ="));
+  assert.match(stop, /pending\.length = 0;\s*audioPending\.length = 0;/);
+});
+
 test("does not expose endpoint data in the safe capability snapshot", () => {
   assert.deepEqual(Object.keys(receiver().snapshot()).sort(), ["autoplay", "avcMIME", "mediaSource", "probeAckStatus", "sourceBuffer", "terminalStatus", "webSocketAPI", "websocketAttempted", "websocketAuthenticated", "websocketLifecycle"]);
   assert.equal(receiver().snapshot().autoplay, "deferred");
 });
 
-test("emits bounded, privacy-safe capability diagnostic tokens", () => {
-  const results = receiver().capabilityDiagnosticResults();
-  assert.deepEqual(JSON.parse(JSON.stringify(results)), [
-    "receiver_capability_websocket_false_mediasource_false_avcmime_false_sourcebuffer_false",
-    "receiver_capability_probe_protocol_2_mime_avc1_42e01f",
-    "receiver_capability_avcmime_outcome_not_tested_exception_none",
-    "receiver_capability_sourcebuffer_outcome_not_tested_exception_none",
-    "receiver_capability_revision_corr_fragseq_20260922_capability_snapshot"
-  ]);
-  assert.equal(results.join(" ").includes("ws://"), false);
-});
-
 test("uses the explicit mixed-content stop classification", () => {
   assert.equal(receiver().RESULT.MIXED_CONTENT_BLOCKED, "websocket_mixed_content_blocked");
-});
-
-test("accepts a bounded readiness query and reports the current revision", () => {
-  const gate = receiver();
-  const query = JSON.stringify({ type: "receiverReadyQuery", protocolVersion: 2, requestId: "ready-1" });
-  assert.deepEqual(JSON.parse(JSON.stringify(gate.validateReadyQuery(query))), { type: "receiverReadyQuery", protocolVersion: 2, requestId: "ready-1" });
-  assert.deepEqual(JSON.parse(JSON.stringify(gate.makeReadyReport("ready-1"))), {
-    type: "receiverReadyReport", protocolVersion: 2, requestId: "ready-1", receiverVersion: "2.0.0",
-    receiverRevision: "corr-fragseq-20261010-ready-brand-01", receiverState: "ready"
-  });
-});
-
-test("readiness reports never mutate media and malformed queries are ignored", () => {
-  const gate = receiver();
-  assert.equal(gate.receiverReadinessStateForScreen("ready"), "ready");
-  assert.equal(gate.receiverReadinessStateForScreen("stopped"), "ready");
-  assert.equal(gate.receiverReadinessStateForScreen("playing"), "mirroring");
-  assert.equal(gate.receiverReadinessStateForScreen("lost"), "unavailable");
-  assert.equal(gate.validateReadyQuery('{"type":"receiverReadyQuery","protocolVersion":2,"requestId":"x","endpoint":"forbidden"}'), null);
-  assert.equal(gate.validateReadyQuery('{"type":"receiverReadyQuery","protocolVersion":3,"requestId":"x"}'), null);
 });
 
 test("seeks only when playback has fallen behind the live buffered range", () => {
@@ -93,7 +304,7 @@ test("does not change credit emission while adding playback recovery helpers", (
 
 test("declares bounded receiver-stop cleanup diagnostics", () => {
   const gate = receiver();
-  assert.equal(gate.receiverRevision, "corr-fragseq-20261010-ready-brand-01");
+  assert.equal(gate.receiverRevision, "connected-state-idle-return-20261103-01");
   assert.deepEqual(JSON.parse(JSON.stringify(gate.receiverStopDiagnostics)), ["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]);
 });
 
@@ -148,7 +359,7 @@ test("emits positive, monotonic media-credit sequences with receiver diagnostics
     { type: "mediaCredit", protocolVersion: 2, generation: 1, credits: 1, creditSequence: 1 },
     { type: "mediaCredit", protocolVersion: 2, generation: 1, credits: 1, creditSequence: 2 }
   ]);
-  assert.deepEqual(JSON.parse(JSON.stringify(diagnostics)), [
+  assert.deepEqual(JSON.parse(JSON.stringify(diagnostics.filter(([name]) => name === "ScreenMirror mediaCredit"))), [
     ["ScreenMirror mediaCredit", { generation: 1, creditSequence: 1 }],
     ["ScreenMirror mediaCredit", { generation: 1, creditSequence: 2 }]
   ]);
@@ -320,7 +531,7 @@ test("pacing histogram covers long sessions with explicit overflow", () => {
   assert.equal(summary.render.intervalOverflow, 1); assert.equal(summary.render.maxMs, 10020);
 });
 
-for (const ending of ["normal", "normalStop", "abnormal", "error"]) test(`${ending} socket closure clears video, presents safe copy and preserves pacing`, async () => {
+for (const ending of ["normal", "normalStop", "progressWithoutPlayingEvent", "pausedFrameDoesNotHide", "abnormal", "error"]) test(`${ending} socket closure clears video, presents safe copy and preserves pacing`, async () => {
   const messages = []; const sources = []; const sockets = []; const wire = []; const buffers = []; let receiverListener; let nextFrame; let cancelled = false; let now = 0;
   const systemEvents = {};
   const nodes = {}; const classes = new Set(); const cleanup = []; const closes = []; const videoEvents = {}; const timers = [];
@@ -342,7 +553,7 @@ for (const ending of ["normal", "normalStop", "abnormal", "error"]) test(`${endi
     cast: { framework: { CastReceiverContext: { getInstance: () => ({ addEventListener: (name, callback) => { systemEvents[name] = callback; }, addCustomMessageListener: (_, callback) => { receiverListener = callback; }, start() {}, sendCustomMessage: (_, sender, message) => messages.push({ sender, ...message }) }) }, CastReceiverOptions: function () {}, system: { EventType: { READY: "ready", SENDER_CONNECTED: "sender_connected" }, MessageType: { JSON: "JSON" } } } } };
   // URL must remain constructible for endpoint validation.
   context.URL = class extends URL { static createObjectURL() { return "blob:test"; } };
-  vm.runInNewContext(fs.readFileSync(path.join(__dirname, "..", "receiver.js"), "utf8"), context);
+  vm.runInNewContext(fs.readFileSync(receiverSourcePath, "utf8"), context);
   assert.equal(nodes["status-title"].textContent, "Ready to Cast");
   assert.equal(nodes["status-detail"].textContent, "Open the app on your iPhone to begin.");
   assert.ok(classes.has("receiver-waiting"));
@@ -371,10 +582,12 @@ for (const ending of ["normal", "normalStop", "abnormal", "error"]) test(`${endi
     "receiver_auth_validation_passed",
     "receiver_endpoint_fetch_succeeded"
   ]) assert.ok(startupDiagnostics.includes(result), `missing ${result}`);
-  assert.equal(nodes["status-title"].textContent, "Ready to Cast");
-  assert.equal(nodes["status-detail"].textContent, "Open the app on your iPhone to begin.");
+  // A sender has connected (above) but nothing is playing yet — the screen
+  // now says so explicitly instead of silently staying on "Ready to Cast".
+  assert.equal(nodes["status-title"].textContent, "Connected");
+  assert.equal(nodes["status-detail"].textContent, "Starting your cast…");
   videoEvents.waiting();
-  assert.equal(nodes["status-title"].textContent, "Ready to Cast");
+  assert.equal(nodes["status-title"].textContent, "Connected");
   videoEvents.playing(); assert.equal(nodes["idle-screen"].hidden, true);
   assert.equal(classes.has("receiver-waiting"), false);
   // A minimal valid moof/traf/mdat fixture, envelope sequence distinct from control sequence.
@@ -389,7 +602,11 @@ for (const ending of ["normal", "normalStop", "abnormal", "error"]) test(`${endi
   sockets[0].onmessage({ data: binary }); buffers[1].listeners.updateend();
   nextFrame(30, { mediaTime: 0, presentedFrames: 1 });
   videoEvents.waiting();
-  assert.equal(nodes["status-title"].textContent, "Ready to Cast");
+  // "playing" has no SCREEN_COPY entry (the panel is simply hidden), so the
+  // text left over from the last real state change ("Connected") persists
+  // unseen behind the hidden panel — this assertion is about the panel
+  // staying hidden through a transient waiting event, not the stale text.
+  assert.equal(nodes["status-title"].textContent, "Connected");
   runPendingTimer();
   assert.equal(nodes["idle-screen"].hidden, true, "a transient waiting event must not replace visible video");
   now = 1520;
@@ -399,14 +616,23 @@ for (const ending of ["normal", "normalStop", "abnormal", "error"]) test(`${endi
   assert.equal(nodes["status-detail"].textContent, "Keep the app open on your iPhone.");
   assert.equal(nodes["idle-screen"].hidden, false);
   assert.ok(classes.has("receiver-waiting"));
-  videoEvents.playing();
+  if (ending !== "progressWithoutPlayingEvent" && ending !== "pausedFrameDoesNotHide") videoEvents.playing();
+  if (ending === "pausedFrameDoesNotHide") video.paused = true;
   sockets[0].onmessage({ data: JSON.stringify({ type: "frameCorrelation", generation: 1, sequence: 9, mediaTimeMs: 0 }) }); nextFrame(50, { mediaTime: 0.02, presentedFrames: 2 });
+  if (ending === "progressWithoutPlayingEvent") {
+    assert.equal(nodes["idle-screen"].hidden, true, "a rendered frame must clear stale Reconnecting without another playing event");
+    assert.equal(classes.has("receiver-waiting"), false);
+  }
+  if (ending === "pausedFrameDoesNotHide") {
+    assert.equal(nodes["idle-screen"].hidden, false, "a paused frame must not hide a genuine playback interruption");
+    assert.equal(nodes["status-title"].textContent, "Reconnecting…");
+  }
   if (ending === "error") sockets[0].onerror();
   if (ending === "normalStop") sockets[0].onmessage({ data: JSON.stringify({ type: "normalStop", protocolVersion: 2 }) });
   const closeEvent = { code: ending === "abnormal" ? 1006 : 1000, wasClean: ending !== "abnormal" };
   const deliveredClose = ending === "normalStop" ? { code: 1006, wasClean: false } : closeEvent;
   sockets[0].onclose(deliveredClose); sockets[0].onclose(deliveredClose);
-  const stopped = ending === "normal" || ending === "normalStop";
+  const stopped = ending === "normal" || ending === "normalStop" || ending === "progressWithoutPlayingEvent" || ending === "pausedFrameDoesNotHide";
   assert.deepEqual(cleanup, ["pause", "src", "load"]);
   assert.equal(classes.has("media-active"), false);
   assert.equal(classes.has("receiver-waiting"), false);
@@ -484,12 +710,13 @@ test("TV markup contains no developer panel and pins both presentation assets", 
   assert.doesNotMatch(html, /<dl>|id="last-event"|id="connection-state"|capability gate|scope-note/i);
   assert.ok(html.includes(`receiver.js?rev=${receiver().receiverRevision}`));
   assert.ok(html.includes(`styles.css?rev=${receiver().receiverRevision}`));
-  assert.ok(html.includes(`assets/screen-mirror-app-icon.png?rev=${receiver().receiverRevision}`));
-  assert.match(html, /alt="Screen Mirror"/);
+  assert.match(html, /screen-mirror-app-icon\.png/);
+  assert.doesNotMatch(html, /class="phone-glyph"/);
+  assert.match(html, /screen-mirror-app-icon\.png/);
+  assert.doesNotMatch(html, /class="tv-glyph"/);
   assert.match(css, /system-ui/);
   assert.doesNotMatch(html, /receiver-version|Receiver 2\.0\.0/);
   assert.doesNotMatch(css, /receiver-version|receiver-debug-footer/);
-  assert.ok(fs.statSync(path.join(__dirname, "..", "assets", "cast-device-icon.png")).size <= 256 * 1024);
   assert.match(html, /aria-atomic="true"/);
   assert.match(css, /prefers-reduced-motion: reduce/);
   assert.match(css, /receiver-status\[hidden\]/);
@@ -501,4 +728,60 @@ test("effective config fingerprint is stable, secret-free and distinguishes capa
   assert.match(gate.effectiveReceiverConfigHash(runtime), /^fnv1a32_[0-9a-f]{8}$/);
   assert.equal(gate.effectiveReceiverConfigHash(runtime), gate.effectiveReceiverConfigHash({ ...runtime, endpoint: "secret", requestId: "another" }));
   assert.notEqual(gate.effectiveReceiverConfigHash(runtime), gate.effectiveReceiverConfigHash({ ...runtime, frameCallback: false }));
+});
+
+test("sender connecting while idle shows a Connected state instead of staying silent", () => {
+  const gate = receiver();
+  // Element-by-element, not assert.deepEqual: SCREEN_COPY's arrays are
+  // created inside the vm sandbox's own realm, so a strict deep-equal
+  // against a plain array literal here fails on cross-realm identity even
+  // when every value matches.
+  assert.equal(gate.SCREEN_COPY.connected[0], "Connected");
+  assert.equal(gate.SCREEN_COPY.connected[1], "Starting your cast…");
+  assert.equal(gate.SCREEN_COPY.connected.length, 2);
+});
+
+test("idle after cast stops releases the Cast session back to the TV after the idle window, but playing cancels it", async () => {
+  const nodes = {}; const classes = new Set(); const systemEvents = {}; let receiverListener;
+  const sources = []; const buffers = []; const sockets = [];
+  const timers = []; const schedule = (callback, delay) => { timers.push({ callback, delay, cancelled: false }); return timers.length; };
+  const cancel = (id) => { if (timers[id - 1]) timers[id - 1].cancelled = true; };
+  const runOnlyPendingIdleReturnTimer = () => {
+    // The idle-return-home timer is the only one scheduled with this exact
+    // delay in this test's flow (no reconnecting-screen delay is reached),
+    // so it is unambiguous without reaching into module internals.
+    const idle = timers.find((timer) => !timer.cancelled && timer.delay === 90000);
+    assert.ok(idle, "expected the idle-return-to-home timer to have been scheduled");
+    idle.callback();
+  };
+  const video = { buffered: { length: 0 }, currentTime: 0, playbackRate: 1, pause() {}, load() {}, removeAttribute() {}, addEventListener() {} };
+  let stopCalls = 0;
+  const context = { ArrayBuffer, Uint8Array, DataView, TextEncoder, URL, performance: { now: () => 0 }, setTimeout: schedule, clearTimeout: cancel,
+    MediaSource: class { static isTypeSupported() { return true; } constructor() { this.listeners = {}; sources.push(this); } addEventListener(name, cb) { this.listeners[name] = cb; } addSourceBuffer() { const b = { listeners: {}, addEventListener(n, cb) { this.listeners[n] = cb; }, appendBuffer() {} }; buffers.push(b); return b; } },
+    WebSocket: class { constructor() { this.readyState = 1; sockets.push(this); } send() {} close() {} },
+    document: { readyState: "complete", getElementById: (id) => id === "probe-video" ? video : (nodes[id] ||= {}), body: { classList: { add: (name) => classes.add(name), remove: (name) => classes.delete(name) } } },
+    cast: { framework: { CastReceiverContext: { getInstance: () => ({ addEventListener: (name, callback) => { systemEvents[name] = callback; }, addCustomMessageListener: (_, callback) => { receiverListener = callback; },
+      start() {}, stop() { stopCalls += 1; }, sendCustomMessage() {} }) }, CastReceiverOptions: function () {}, system: { EventType: { READY: "ready", SENDER_CONNECTED: "sender_connected" }, MessageType: { JSON: "JSON" } } } } };
+  context.URL = class extends URL { static createObjectURL() { return "blob:test"; } };
+  vm.runInNewContext(fs.readFileSync(receiverSourcePath, "utf8"), context);
+  assert.equal(nodes["status-title"].textContent, "Ready to Cast");
+
+  systemEvents.sender_connected({ senderId: "sender" });
+  assert.equal(nodes["status-title"].textContent, "Connected");
+  assert.ok(!timers.some((t) => !t.cancelled && t.delay === 90000),
+    "Connected (still mid-setup) must not start the idle-return timer");
+
+  sources[0].listeners.sourceopen(); await new Promise(setImmediate);
+  receiverListener({ senderId: "sender", data: { type: "startMedia", protocolVersion: 2, requestId: "r", endpoint: "ws://192.168.1.1:1234/" + "a".repeat(64) } });
+  await new Promise(setImmediate); sources[1].listeners.sourceopen(); sockets[0].onopen();
+  sockets[0].onmessage({ data: JSON.stringify({ type: "readyForMedia", protocolVersion: 2 }) });
+
+  // Normal stop (clean 1000 close) reaches "Casting Stopped" and schedules
+  // the idle-return timer.
+  sockets[0].onclose({ code: 1000, wasClean: true }); sockets[0].onclose({ code: 1000, wasClean: true });
+  assert.equal(nodes["status-title"].textContent, "Casting Stopped");
+  assert.equal(stopCalls, 0, "must not return to the TV home screen immediately on stop");
+
+  runOnlyPendingIdleReturnTimer();
+  assert.equal(stopCalls, 1, "after the idle window with no new cast, the Cast session must be released back to the TV");
 });

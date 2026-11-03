@@ -2,7 +2,14 @@
   "use strict";
 
   const RECEIVER_VERSION = "2.0.0";
-  const RECEIVER_REVISION = "audio-retry-20261102-03";
+  const RECEIVER_REVISION = "connected-state-idle-return-20261103-01";
+  // After this many ms with no active cast (sitting on "Casting Stopped" or
+  // "Connection Lost"), release the Cast session so the TV returns to its
+  // own home screen instead of sitting on an idle Screen Mirror page
+  // indefinitely. Does not apply to "Ready to Cast" (first launch, still
+  // mid-setup) or "Reconnecting" (an in-progress recovery) — only after a
+  // cast has actually stopped or dropped.
+  const IDLE_RETURN_TO_HOME_MS = 90000;
   const PROTOCOL_VERSION = 2;
   const NAMESPACE = "urn:x-cast:com.ashwinbhajan.screenmirror.cmafprobe.v2";
   const MIME_TYPE = 'video/mp4; codecs="avc1.42e01f"';
@@ -65,12 +72,34 @@
   function safeObject(value) { return value !== null && typeof value === "object" && !Array.isArray(value); }
   const SCREEN_COPY = Object.freeze({
     ready: Object.freeze(["Ready to Cast", "Open the app on your iPhone to begin."]),
+    connected: Object.freeze(["Connected", "Starting your cast…"]),
     stopped: Object.freeze(["Casting Stopped", "Ready when you are. Start casting again from your iPhone."]),
     lost: Object.freeze(["Connection Lost", "We’re waiting for your iPhone. Check Wi‑Fi and start casting again."]),
     reconnecting: Object.freeze(["Reconnecting…", "Keep the app open on your iPhone."])
   });
+  // Only "stopped" and "lost" count as genuinely idle for the return-to-home
+  // timer — "ready" is first launch (still mid-setup) and "reconnecting" is
+  // an in-progress recovery, neither of which should be cut short.
+  const IDLE_RETURN_TO_HOME_STATES = Object.freeze(["stopped", "lost"]);
+  let idleReturnToHomeTimer = null;
+  function cancelIdleReturnToHomeTimer() {
+    if (idleReturnToHomeTimer === null) return;
+    global.clearTimeout(idleReturnToHomeTimer);
+    idleReturnToHomeTimer = null;
+  }
+  function scheduleIdleReturnToHomeTimer() {
+    cancelIdleReturnToHomeTimer();
+    idleReturnToHomeTimer = global.setTimeout(() => {
+      idleReturnToHomeTimer = null;
+      try {
+        if (context && typeof context.stop === "function") context.stop();
+      } catch (_) {}
+    }, IDLE_RETURN_TO_HOME_MS);
+  }
   function showScreen(state) {
     receiverReadinessState = receiverReadinessStateForScreen(state);
+    if (IDLE_RETURN_TO_HOME_STATES.includes(state)) scheduleIdleReturnToHomeTimer();
+    else cancelIdleReturnToHomeTimer();
     if (!ui) return;
     const copy = SCREEN_COPY[state];
     ui.panel.hidden = state === "playing";
@@ -1530,6 +1559,12 @@
         if (!event || typeof event.senderId !== "string") return;
         if (senderConnections.size >= 4) senderConnections.delete(senderConnections.keys().next().value);
         senderConnections.set(event.senderId, receiverNow());
+        // Previously silent: the receiver knew a phone had connected but
+        // never said so on screen, so a slow or failed handshake looked
+        // identical to nothing happening. Only show it while still idle —
+        // never interrupt an already-playing cast or override a more
+        // specific in-progress state.
+        if (receiverReadinessState !== "mirroring" && ui && ui.panel.hidden === false) showScreen("connected");
       });
     }
     context.addCustomMessageListener(NAMESPACE, receiverMessage);
